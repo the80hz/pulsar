@@ -522,6 +522,57 @@ static MINI: Model = Model {
     zigbee_boot: "",
 };
 
+/// Станция 2 (YNDX-00051, yandexmidi): предварительный профиль, см. docs/station2.md.
+static STATION2: Model = Model {
+    codename: "station-midi",
+    host_prefix: "yandex-station2-",
+    friendly_name: "Яндекс Станция 2",
+    model_name: "Yandex Station 2",
+    capture_pcm: "hw:0,2",
+    capture_rate: 48000,
+    capture_channels: 16,
+    capture_format: CaptureFormat::S16,
+    mic_channels: &[0, 2, 4, 6],
+    spk_channels: &[8, 9],
+    vqe_preset: "yandexmidi",
+    wake_preroll: &[],
+    led_prefix: "",
+    ring: NO_STRIP,
+    logo: NO_STRIP,
+    clock_dir: "",
+    clock_seg_base: 'a',
+    clock_pos_base: 1,
+    clock_colon: &[],
+    clock_aux: &[],
+    clock_center: "",
+    clock_chip_current: false,
+    has_clock: false,
+    // The owner's station-touch handles the keys.
+    keys_input: "",
+    mute_input: "gpio-keys",
+    mute_gpio: 0,
+    action_key: 0,
+    mute_key: 0,
+    error_sound: "ru-RU/playback_error.mp3",
+    wake_sound: "common/spotter_start.mp3",
+    cancel_sound: "common/spotter_cancel.mp3",
+    timer_sound: "common/timer.wav",
+    volume_sound: "common/volume_sound.mp3",
+    playback_pcm: "dmix_spk_plug",
+    alsa_config: "",
+    alsa_lib: "",
+    // Master also drives the amplifier through hardvold and must stay at 255.
+    software_volume: true,
+    spk_mute_ctl: "",
+    amp_enable_paths: &[],
+    volume_map: STOCK_VOLUME,
+    volume_min_step: true,
+    has_lux: false,
+    zigbee_tty: "",
+    zigbee_reset: "",
+    zigbee_boot: "",
+};
+
 // The Mini 3's quasar.cfg platformToAlsaMap: { "0": 0, "1": 33, "20": 255 }.
 const MINI3_VOLUME: &[VolumePoint] = &[
     VolumePoint { level: 0, raw: 0 },
@@ -670,6 +721,7 @@ pub fn model_from_compatible(raw: &[u8]) -> Option<&'static Model> {
         b"yandex,plum" => Some(&LITE2),
         b"yandex,station-mini2" => Some(&MINI2),
         b"yandex,bergamot" => Some(&MINI3),
+        b"yandex,station-midi" => Some(&STATION2),
         _ => None,
     })
 }
@@ -774,6 +826,19 @@ mod tests {
         assert_eq!(m.ring.fb_name, "logo");
         assert_eq!(m.logo.count, 0);
         assert!(!m.has_clock && m.has_lux);
+    }
+
+    #[test]
+    fn station_midi_is_station2() {
+        let m = model_from_compatible(b"yandex,station-midi\0amlogic, axg\0").unwrap();
+        assert_eq!(m.codename, "station-midi");
+        assert_eq!(m.vqe_preset, "yandexmidi");
+        assert_eq!(m.capture_channels, 16);
+        assert_eq!(m.mic_channels, &[0, 2, 4, 6]);
+        assert_eq!(m.spk_channels, &[8, 9]);
+        // Master drives the amplifier through hardvold: the daemon must not touch it.
+        assert!(m.software_volume);
+        assert!(!m.has_button_events());
     }
 
     #[test]
