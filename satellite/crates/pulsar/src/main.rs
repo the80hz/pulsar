@@ -8,6 +8,7 @@ mod airplay;
 mod controller;
 #[allow(unsafe_code)]
 mod crash;
+mod owner_light;
 mod settings;
 #[allow(unsafe_code)]
 mod sys;

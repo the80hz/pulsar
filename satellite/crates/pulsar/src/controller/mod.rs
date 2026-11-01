@@ -27,6 +27,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::airplay::{self, AirplayEvent, AirplayHandle};
+use crate::owner_light::{self, OwnerLightHandle};
 use crate::settings::{Settings, StateFile};
 use crate::version::{BUILD_TIME, VERSION};
 use logic::{HaTimer, Phase, RunBinding};
@@ -134,6 +135,7 @@ pub struct Controller {
     updater: UpdaterHandle,
     arbiter: ArbiterHandle,
     airplay: AirplayHandle,
+    owner_light: OwnerLightHandle,
     /// Диалог поставил AirPlay на паузу и должен его вернуть.
     airplay_paused: bool,
     /// Выход ещё занят AirPlay: ответ ждёт его освобождения.
@@ -364,6 +366,7 @@ impl Controller {
         let (player, player_rx) = pulsar_media::spawn(model);
         let (arbiter, arbiter_rx) = arbiter::spawn(id.name.clone(), ports.arbiter);
         let (airplay, airplay_rx) = airplay::spawn(model);
+        let owner_light = owner_light::spawn();
 
         // Hardware first: UI feedback should work even if HA is not connected.
         let leds = pulsar_hw::spawn_leds(model);
@@ -551,6 +554,7 @@ impl Controller {
             updater,
             arbiter,
             airplay,
+            owner_light,
             airplay_paused: false,
             airplay_wait: false,
             tts_held: false,
@@ -865,6 +869,7 @@ impl Controller {
     fn show_ui(&self, s: UiState) {
         self.leds.set_ui_state(s);
         self.clock.set_ui_state(s);
+        self.owner_light.set_ui_state(s);
     }
 
     fn update_detection(&self) {
