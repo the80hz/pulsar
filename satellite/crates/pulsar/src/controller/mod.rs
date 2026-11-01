@@ -26,6 +26,7 @@ use pulsar_zigbee::{ZigbeeConfig, ZigbeeEvent, ZigbeeHandle};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::airplay::{self, AirplayEvent, AirplayHandle};
 use crate::settings::{Settings, StateFile};
 use crate::version::{BUILD_TIME, VERSION};
 use logic::{HaTimer, Phase, RunBinding};
@@ -107,6 +108,7 @@ struct Rx {
     frontend: Option<UnboundedReceiver<FrontendEvent>>,
     player: Option<UnboundedReceiver<PlayerEvent>>,
     arbiter: Option<UnboundedReceiver<ArbiterEvent>>,
+    airplay: Option<UnboundedReceiver<AirplayEvent>>,
     input: Option<UnboundedReceiver<InputEvent>>,
     lux: Option<UnboundedReceiver<f32>>,
     sendspin: Option<UnboundedReceiver<SendspinEvent>>,
@@ -131,6 +133,13 @@ pub struct Controller {
     zigbee: Option<ZigbeeHandle>,
     updater: UpdaterHandle,
     arbiter: ArbiterHandle,
+    airplay: AirplayHandle,
+    /// Диалог поставил AirPlay на паузу и должен его вернуть.
+    airplay_paused: bool,
+    /// Выход ещё занят AirPlay: ответ ждёт его освобождения.
+    airplay_wait: bool,
+    /// Ответ пришёл во время ожидания и сыграется после `AirplayEvent::Released`.
+    tts_held: bool,
     /// Held only: the input actor runs while its handle exists.
     _input: Option<InputHandle>,
     clock: pulsar_clock::ClockHandle,
@@ -354,6 +363,7 @@ impl Controller {
         // C code on another thread could be reading.
         let (player, player_rx) = pulsar_media::spawn(model);
         let (arbiter, arbiter_rx) = arbiter::spawn(id.name.clone(), ports.arbiter);
+        let (airplay, airplay_rx) = airplay::spawn(model);
 
         // Hardware first: UI feedback should work even if HA is not connected.
         let leds = pulsar_hw::spawn_leds(model);
@@ -540,6 +550,10 @@ impl Controller {
             zigbee,
             updater,
             arbiter,
+            airplay,
+            airplay_paused: false,
+            airplay_wait: false,
+            tts_held: false,
             _input: input,
             clock,
             leds,
@@ -553,6 +567,7 @@ impl Controller {
                 frontend: Some(mic_rx),
                 player: Some(player_rx),
                 arbiter: Some(arbiter_rx),
+                airplay: Some(airplay_rx),
                 input: input_rx,
                 lux: lux_rx,
                 sendspin: sendspin_rx,
@@ -679,6 +694,10 @@ impl Controller {
                         }
                     }
                     None => self.rx.arbiter = None,
+                },
+                ev = recv(&mut self.rx.airplay) => match ev {
+                    Some(AirplayEvent::Released { closed }) => self.airplay_released(closed),
+                    None => self.rx.airplay = None,
                 },
                 ev = recv(&mut self.rx.input) => match ev {
                     Some(ev) => self.on_input(ev),

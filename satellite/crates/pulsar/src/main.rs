@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod airplay;
 mod controller;
 #[allow(unsafe_code)]
 mod crash;

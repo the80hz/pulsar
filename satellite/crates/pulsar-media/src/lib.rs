@@ -10,6 +10,8 @@ mod gst;
 pub mod mixer;
 mod pcm_out;
 mod player;
+mod shared_out;
 
 pub use mixer::Mixer;
 pub use player::{Channel, PlayId, PlayState, PlayerEvent, PlayerHandle, spawn};
+pub use shared_out::available as shared_output_available;

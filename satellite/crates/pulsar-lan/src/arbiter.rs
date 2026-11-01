@@ -21,6 +21,7 @@ use tokio::time::Instant;
 
 use crate::errstr;
 
+const ROUTES: &str = "/proc/net/route";
 /// Spotter confirmations of one utterance on stations a few metres apart land within ~100 ms of
 /// each other; the window adds Wi-Fi latency on top. It delays the earcon by as much.
 const WINDOW_MS: i64 = 250;
@@ -208,6 +209,31 @@ fn launch(
     (ArbiterHandle { next_id, link }, events_rx)
 }
 
+/// Широковещательный адрес подсети маршрута по умолчанию.
+///
+/// см. docs/station2-airplay.md, «Арбитраж»
+fn lan_broadcast(routes: &str) -> Option<Ipv4Addr> {
+    const ANY: &str = "00000000";
+    let rows: Vec<Vec<&str>> = routes
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    let iface = rows
+        .iter()
+        .find(|row| row.get(1) == Some(&ANY) && row.get(7) == Some(&ANY))?
+        .first()?;
+    rows.iter().find_map(|row| {
+        if row.first() != Some(iface) || row.get(2) != Some(&ANY) {
+            return None;
+        }
+        let net = u32::from_str_radix(row.get(1)?, 16).ok()?;
+        let mask = u32::from_str_radix(row.get(7)?, 16).ok()?;
+        // Ядро печатает адрес в сетевом порядке байт как число своей архитектуры.
+        (mask != 0).then(|| Ipv4Addr::from((net | !mask).to_ne_bytes()))
+    })
+}
+
 fn open(port: u16) -> Result<UdpSocket, (String, io::Error)> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM.nonblocking(), None)
         .map_err(|e| ("socket".to_owned(), e))?;
@@ -236,7 +262,7 @@ struct Received {
 struct Arbiter {
     station: String,
     sock: UdpSocket,
-    /// 255.255.255.255:<port>
+    /// 255.255.255.255:<port>, на отправке заменяется адресом подсети: см. `claim_dest`
     dest: SocketAddrV4,
     /// One entry per peer station: its latest claim.
     recent: Vec<Received>,
@@ -374,11 +400,23 @@ impl Arbiter {
         }
     }
 
+    /// Подсеть читается при каждой отправке: станция могла сменить сеть после старта.
+    fn claim_dest(&self) -> SocketAddrV4 {
+        if !self.dest.ip().is_broadcast() {
+            return self.dest;
+        }
+        let subnet = std::fs::read_to_string(ROUTES)
+            .ok()
+            .and_then(|routes| lan_broadcast(&routes));
+        subnet.map_or(self.dest, |ip| SocketAddrV4::new(ip, self.dest.port()))
+    }
+
     fn send(&self) {
         let Some(d) = &self.datagram else { return };
         // A plain sendto: tokio's try_send_to drops datagrams until the reactor has first seen
         // the socket writable.
-        if let Err(e) = SockRef::from(&self.sock).send_to(d.as_bytes(), &self.dest.into()) {
+        let dest = self.claim_dest();
+        if let Err(e) = SockRef::from(&self.sock).send_to(d.as_bytes(), &dest.into()) {
             debug!("arbiter: sendto: {}", errstr(&e));
         }
     }

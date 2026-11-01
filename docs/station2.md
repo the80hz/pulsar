@@ -5,6 +5,9 @@
 [вики](https://hackalice.me/devices/station-2/); здесь только то, чего там нет. Не путать с розничной
 Миди (`cucumber`).
 
+Остальное о Станции 2: [исследования и решения](station2-research.md),
+[пайплайн AirPlay](station2-airplay.md), [эквалайзер](station2-equalizer.md).
+
 ## Userland и хранилище
 
 - `compatible`: `yandex,station-midi`, `amlogic, axg`; `deviceType` в `quasar.cfg`: `yandexmidi`.

@@ -227,7 +227,15 @@ impl Controller {
         self.tts_played = false;
         self.continue_conversation = false;
         self.update_duck();
-        if earcon {
+        let airplay_paused = !self.airplay_paused && self.airplay.pause_if_playing();
+        // На общем dmix выход всегда свободен. Иначе его занимает AirPlay, а пауза сама
+        // подтверждает, что станция услышала.
+        let output_busy = airplay_paused && !pulsar_media::shared_output_available();
+        if airplay_paused {
+            self.airplay_paused = true;
+            self.airplay_wait = output_busy;
+        }
+        if earcon && !output_busy {
             let sound = format!("{SOUNDS}{}", self.model.wake_sound);
             self.player.play(Channel::Announce, vec![sound]);
         }
@@ -325,7 +333,7 @@ impl Controller {
             }
             VaEvent::RunEnd => {
                 self.stop_streaming();
-                if !self.tts_played {
+                if !self.tts_played && !self.tts_held {
                     self.finish_interaction();
                 }
             }
@@ -337,6 +345,10 @@ impl Controller {
 
     fn play_tts(&mut self) {
         if self.tts_played || self.tts_url.is_empty() {
+            return;
+        }
+        if self.airplay_wait {
+            self.tts_held = true;
             return;
         }
         self.tts_played = true;
@@ -375,12 +387,26 @@ impl Controller {
         self.api.voice_answer_finished(ok);
     }
 
+    /// Выход свободен или ждать больше нечего: задержанный ответ играет в любом случае, ошибка
+    /// открытия выхода завершит диалог штатно.
+    pub(super) fn airplay_released(&mut self, closed: bool) {
+        info!("airplay: paused, output free: {closed}");
+        self.airplay_wait = false;
+        if std::mem::take(&mut self.tts_held) {
+            self.play_tts();
+        }
+    }
+
     pub(super) fn finish_interaction(&mut self) {
         // The dialog may end before its run does (answer cut short, cancel, timeout): stop the
         // run so HA does not go on generating; whatever it still sends is dropped while idle.
         if (self.run.run_active || self.run.awaiting_run_start) && !self.stop_sent {
             self.api.voice_request_stop();
             self.stop_sent = true;
+        }
+        self.tts_held = false;
+        if std::mem::take(&mut self.airplay_paused) {
+            self.airplay.resume();
         }
         self.run.awaiting_run_start = false;
         self.send_tts_report(false);

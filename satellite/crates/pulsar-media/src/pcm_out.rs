@@ -29,6 +29,8 @@ use log::{debug, error, info, warn};
 use pulsar_alsa::{Format, HwRequest, Pcm};
 use pulsar_core::model::Model;
 
+use crate::shared_out::{self, SharedOut};
+
 /// The format playsink converts to (capsfilter before the fdsink) and the PCM is opened with.
 pub(crate) const CAPS: &str = "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2";
 const RATE: u32 = 48_000;
@@ -245,6 +247,56 @@ enum Phase {
     Draining,
 }
 
+/// Вывод на станции с общим dmix приёмника идёт через его 64-битный клиент: см. `shared_out`.
+enum Sink {
+    Alsa(Pcm),
+    Shared(SharedOut),
+}
+
+impl Sink {
+    fn avail_update(&mut self) -> Result<usize, i32> {
+        match self {
+            Self::Alsa(pcm) => pcm.avail_update(),
+            Self::Shared(out) => out.avail_update(),
+        }
+    }
+
+    fn writei(&mut self, buf: &[u8], frames: usize) -> Result<usize, i32> {
+        match self {
+            Self::Alsa(pcm) => pcm.writei(buf, frames),
+            Self::Shared(out) => out.writei(buf, frames),
+        }
+    }
+
+    fn delay(&mut self) -> Result<i64, i32> {
+        match self {
+            Self::Alsa(pcm) => pcm.delay(),
+            Self::Shared(out) => out.delay(),
+        }
+    }
+
+    fn drop_frames(&mut self) -> Result<(), i32> {
+        match self {
+            Self::Alsa(pcm) => pcm.drop_frames(),
+            Self::Shared(_) => Ok(()),
+        }
+    }
+
+    fn resume(&mut self) -> Result<(), i32> {
+        match self {
+            Self::Alsa(pcm) => pcm.resume(),
+            Self::Shared(_) => Err(-libc::EPIPE),
+        }
+    }
+
+    fn prepare(&mut self) -> Result<(), i32> {
+        match self {
+            Self::Alsa(pcm) => pcm.prepare(),
+            Self::Shared(_) => Err(-libc::EPIPE),
+        }
+    }
+}
+
 struct Writer {
     model: &'static Model,
     notify: Box<dyn Fn(OutEvent) + Send>,
@@ -254,7 +306,7 @@ struct Writer {
     /// Device fill below which an empty feed is a stall.
     low_frames: usize,
     cur: Option<(u64, Arc<Feed>)>,
-    pcm: Option<Pcm>,
+    pcm: Option<Sink>,
     phase: Phase,
     /// Started was reported for the current item.
     started: bool,
@@ -520,7 +572,21 @@ impl Writer {
         }
     }
 
-    fn open(&mut self) -> Result<Pcm, (&'static str, i32)> {
+    fn open_shared(&mut self) -> Result<Sink, (&'static str, i32)> {
+        pulsar_alsa::enable_output(self.model);
+        let out = SharedOut::open().map_err(|e| ("open", e))?;
+        self.buffer_frames = shared_out::BUFFER_FRAMES;
+        self.period_frames = shared_out::PERIOD_FRAMES;
+        self.silence.resize(self.period_frames * FRAME_BYTES, 0);
+        self.low_frames = (LOW_PERIODS * self.period_frames).min(self.buffer_frames / 2);
+        debug!("player: announce output open through the shared dmix");
+        Ok(Sink::Shared(out))
+    }
+
+    fn open(&mut self) -> Result<Sink, (&'static str, i32)> {
+        if shared_out::available() {
+            return self.open_shared();
+        }
         let mut pcm = pulsar_alsa::open_playback(self.model).map_err(|e| ("open", e))?;
         let hw = pcm
             .set_hw_params(&HwRequest {
@@ -545,7 +611,7 @@ impl Writer {
             "player: announce output '{}' open (period {period}, buffer {} frames)",
             self.model.playback_pcm, hw.buffer_frames
         );
-        Ok(pcm)
+        Ok(Sink::Alsa(pcm))
     }
 
     /// Ok when the PCM can be written again (after an underrun or a suspend).

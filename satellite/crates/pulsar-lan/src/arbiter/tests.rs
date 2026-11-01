@@ -480,3 +480,32 @@ async fn without_a_socket_every_claim_wins_alone() {
         })
         .await;
 }
+
+const ROUTES_HEAD: &str =
+    "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+
+fn route(iface: &str, dest: [u8; 4], gateway: [u8; 4], mask: [u8; 4]) -> String {
+    let hex = |ip: [u8; 4]| format!("{:08X}", u32::from_ne_bytes(ip));
+    format!(
+        "{iface}\t{}\t{}\t0003\t0\t0\t0\t{}\t0\t0\t0\n",
+        hex(dest),
+        hex(gateway),
+        hex(mask)
+    )
+}
+
+#[test]
+fn lan_broadcast_is_the_subnet_of_the_default_route() {
+    let default = route("wlan0", [0; 4], [192, 168, 1, 1], [0; 4]);
+    let other = route("usb0", [10, 0, 0, 0], [0; 4], [255, 0, 0, 0]);
+    let lan = route("wlan0", [192, 168, 1, 0], [0; 4], [255, 255, 255, 0]);
+    let table = format!("{ROUTES_HEAD}{other}{default}{lan}");
+    assert_eq!(lan_broadcast(&table), Some(Ipv4Addr::new(192, 168, 1, 255)));
+}
+
+#[test]
+fn lan_broadcast_needs_a_default_route() {
+    let lan = route("wlan0", [192, 168, 1, 0], [0; 4], [255, 255, 255, 0]);
+    assert_eq!(lan_broadcast(&format!("{ROUTES_HEAD}{lan}")), None);
+    assert_eq!(lan_broadcast(""), None);
+}
