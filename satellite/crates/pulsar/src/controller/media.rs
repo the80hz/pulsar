@@ -9,8 +9,9 @@ use pulsar_sendspin::SendspinEvent;
 
 use super::logic::{self, AirplayState, cxx_max, cxx_min};
 use super::{
-    AIRPLAY_VOLUME_MAX_WAIT_MS, AIRPLAY_VOLUME_WAIT_MS, AMP_SYNC_MS, AirplayVolume,
-    AirplayVolumeRun, Controller, DUCK_GAIN, Pending, SOUNDS, Tk,
+    AIRPLAY_EXACT_MAX_SHIFTS, AIRPLAY_EXACT_WAIT_MS, AIRPLAY_VOLUME_MAX_WAIT_MS,
+    AIRPLAY_VOLUME_WAIT_MS, AMP_SYNC_MS, AirplayExactRun, AirplayVolume, AirplayVolumeRun,
+    Controller, DUCK_GAIN, Pending, SOUNDS, Tk,
 };
 
 impl Controller {
@@ -200,12 +201,32 @@ impl Controller {
             AirplayVolume::Step(false) => raw - logic::AIRPLAY_WORD_RAW,
             AirplayVolume::Level(v) => volume::to_raw(self.model, v),
         };
+        let target = logic::airplay_exact_target(raw, target);
+        if (target - raw).abs() <= logic::AIRPLAY_EXACT_TOLERANCE_RAW {
+            info!("airplay volume: stays at {raw}, target {target}");
+            return;
+        }
+        info!("airplay volume: from {raw} to {target}");
+        self.airplay_run = None;
+        let delta_db = (target - raw) as f64 / logic::airplay_raw_per_db_estimate(raw);
+        self.airplay_exact = Some(AirplayExactRun {
+            request: volume,
+            target,
+            raw,
+            delta_db,
+            shifts: 1,
+            waited_ms: 0,
+        });
+        self.airplay.shift_volume(delta_db);
+    }
+
+    /// Запасной путь для источников без точного уровня (Spotify): кнопки громкости.
+    fn airplay_volume_steps(&mut self, volume: AirplayVolume, raw: i64, target: i64) {
         let Some(up) = logic::airplay_next_step(raw, target, logic::airplay_step_estimate(raw))
         else {
             info!("airplay volume: stays at {raw}, target {target}");
             return;
         };
-        info!("airplay volume: from {raw} to {target}");
         // Уровень запоминается до запроса: источник может ответить раньше, чем запрос завершится.
         self.airplay_run = Some(AirplayVolumeRun {
             request: volume,
@@ -230,6 +251,17 @@ impl Controller {
     }
 
     pub(super) fn airplay_volume_sent(&mut self, sent: bool) {
+        if let Some(run) = self.airplay_exact.take() {
+            if sent {
+                self.airplay_exact = Some(run);
+                self.timers
+                    .set(Tk::AirplayVolumeCheck, AIRPLAY_EXACT_WAIT_MS);
+            } else {
+                self.sync_amp();
+                self.airplay_volume_steps(run.request, self.mixer.raw(), run.target);
+            }
+            return;
+        }
         if sent {
             self.timers
                 .set(Tk::AirplayVolumeCheck, AIRPLAY_VOLUME_WAIT_MS);
@@ -245,6 +277,9 @@ impl Controller {
     /// Шаг телефона неравномерен, поэтому идём по одному и смотрим на усилитель. Не каждый источник
     /// выполняет команду: без отклика на первый шаг он делается прямо на усилителе.
     pub(super) fn airplay_volume_check(&mut self) {
+        if self.airplay_exact.is_some() {
+            return self.airplay_exact_check();
+        }
         let Some(mut run) = self.airplay_run.take() else {
             return;
         };
@@ -281,6 +316,48 @@ impl Controller {
                 run.target, run.steps
             );
         }
+    }
+
+    /// Кривая источника неровная и у каждой колонки своя: сдвигаемся по замеру усилителя.
+    fn airplay_exact_check(&mut self) {
+        let Some(mut run) = self.airplay_exact.take() else {
+            return;
+        };
+        self.sync_amp();
+        let raw = self.mixer.raw();
+        if (run.target - raw).abs() <= logic::AIRPLAY_EXACT_TOLERANCE_RAW {
+            info!(
+                "airplay volume: done at {raw}, target {}, {} shift(s)",
+                run.target, run.shifts
+            );
+            return;
+        }
+        if raw == run.raw {
+            run.waited_ms += AIRPLAY_EXACT_WAIT_MS;
+            if run.waited_ms < AIRPLAY_VOLUME_MAX_WAIT_MS {
+                self.airplay_exact = Some(run);
+                self.timers
+                    .set(Tk::AirplayVolumeCheck, AIRPLAY_EXACT_WAIT_MS);
+                return;
+            }
+            info!("airplay: source ignored the exact volume");
+            return self.airplay_volume_steps(run.request, raw, run.target);
+        }
+        let slope = logic::airplay_raw_per_db(run.raw, raw, run.delta_db);
+        let (Some(slope), true) = (slope, run.shifts < AIRPLAY_EXACT_MAX_SHIFTS) else {
+            info!(
+                "airplay volume: stopped at {raw}, target {}, {} shift(s)",
+                run.target, run.shifts
+            );
+            return;
+        };
+        run.delta_db = (run.target - raw) as f64 / slope;
+        run.raw = raw;
+        run.shifts += 1;
+        run.waited_ms = 0;
+        let delta_db = run.delta_db;
+        self.airplay_exact = Some(run);
+        self.airplay.shift_volume(delta_db);
     }
 
     /// Stock click after a local change (keys, voice words); `before` = (volume, muted) before it.

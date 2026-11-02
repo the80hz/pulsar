@@ -26,6 +26,13 @@ const AIRPLAY_FLOOR_RAW: i64 = 150;
 pub const AIRPLAY_WORD_RAW: i64 = 12;
 /// Вся шкала телефона.
 pub const AIRPLAY_MAX_STEPS: u32 = 16;
+/// Шаг телефона в единицах источника.
+const AIRPLAY_STEP_DB: f64 = 1.875;
+/// Точная установка считается достигнутой с этой разницей: половина единицы регулятора уже округление.
+pub const AIRPLAY_EXACT_TOLERANCE_RAW: i64 = 1;
+/// Кривая источника: границы для наклона, замеренного на малом сдвиге с округлением усилителя.
+const AIRPLAY_RAW_PER_DB_MIN: f64 = 2.0;
+const AIRPLAY_RAW_PER_DB_MAX: f64 = 12.0;
 
 /// Music paused on this station, or whose Sendspin stream ended (pause or stop in Music
 /// Assistant), stays its own this long: without the wake word the transport and volume words
@@ -325,6 +332,23 @@ pub fn airplay_next_step(raw: i64, target: i64, step_raw: i64) -> Option<bool> {
         return None;
     }
     Some(up)
+}
+
+/// Первая оценка: единиц регулятора на единицу источника.
+pub fn airplay_raw_per_db_estimate(raw: i64) -> f64 {
+    airplay_step_estimate(raw) as f64 / AIRPLAY_STEP_DB
+}
+
+/// Наклон по последнему сдвигу. `None`: уровень ушёл против сдвига, его двигает кто-то ещё.
+pub fn airplay_raw_per_db(raw_before: i64, raw: i64, delta_db: f64) -> Option<f64> {
+    let slope = (raw - raw_before) as f64 / delta_db;
+    (slope > 0.0).then(|| slope.clamp(AIRPLAY_RAW_PER_DB_MIN, AIRPLAY_RAW_PER_DB_MAX))
+}
+
+/// Цель точной установки. Пол только не даёт опуститься в выключенный звук и не поднимает уровень,
+/// если он уже ниже пола.
+pub fn airplay_exact_target(raw: i64, target: i64) -> i64 {
+    target.max(AIRPLAY_FLOOR_RAW.min(raw))
 }
 
 /// Что играет приёмник AirPlay с точки зрения HA.

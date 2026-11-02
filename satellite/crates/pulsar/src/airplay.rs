@@ -29,6 +29,9 @@ const DSP_RUN: &str = "/run/ap2-dsp";
 const DSP_RUN_TMP: &str = "/run/ap2-dsp.pulsar";
 const DSP_SAVED: &str = "/data/local/opt/ap2/etc/dsp.conf";
 const MUTE_LINES: &str = "#pulsar-mute\nmute=1\n";
+/// Шкала источника AirPlay. Ниже неё только -144, выключенный звук.
+const SOURCE_MIN_DB: f64 = -30.0;
+const SOURCE_MAX_DB: f64 = 0.0;
 
 pub enum AirplayEvent {
     /// Запрос громкости ушёл источнику. `sent`: приёмник его принял.
@@ -42,9 +45,14 @@ enum Cmd {
     Resume,
     /// Диалог кончился, а музыка остаётся на паузе: вернуть только заглушение.
     KeepPaused,
+    /// Диалог ведёт другая станция: заглушить музыку, пока её пауза не дойдёт сюда.
+    MuteUntilClosed,
     Action(&'static str),
     Volume {
         up: bool,
+    },
+    ShiftVolume {
+        delta_db: f64,
     },
 }
 
@@ -77,6 +85,14 @@ impl AirplayHandle {
         let _ = self.cmds.send(Cmd::KeepPaused);
     }
 
+    /// Пауза победившей станции доходит до группы только через 3 с: всё это время наша музыка
+    /// попадала бы в её микрофон и VAD считал бы её речью. Не та группа: звук вернётся по таймауту.
+    pub fn mute_until_closed(&self) {
+        if self.playing() {
+            let _ = self.cmds.send(Cmd::MuteUntilClosed);
+        }
+    }
+
     pub fn pause(&self) {
         let _ = self.cmds.send(Cmd::Action("pause"));
     }
@@ -99,6 +115,12 @@ impl AirplayHandle {
     /// команду при следующем запуске потока. Идёт в очереди после паузы и её снятия.
     pub fn step_volume(&self, up: bool) {
         let _ = self.cmds.send(Cmd::Volume { up });
+    }
+
+    /// Сдвиг уровня источника на точную величину. Телефон двигает ползунок, и уровень держится после
+    /// снятия паузы; см. docs/station2-airplay.md, «Команды и громкость под AirPlay».
+    pub fn shift_volume(&self, delta_db: f64) {
+        let _ = self.cmds.send(Cmd::ShiftVolume { delta_db });
     }
 }
 
@@ -156,11 +178,21 @@ async fn run(
                         restore_dsp();
                     }
                 }
+                Some(Cmd::MuteUntilClosed) => {
+                    if !muted && mute_dsp() {
+                        wait_closed().await;
+                        restore_dsp();
+                    }
+                }
                 Some(Cmd::Action(action)) => {
                     run_action(action).await;
                 }
                 Some(Cmd::Volume { up }) => {
                     let sent = run_action(if up { "volume-up" } else { "volume-down" }).await;
+                    let _ = events.send(AirplayEvent::VolumeSent { sent });
+                }
+                Some(Cmd::ShiftVolume { delta_db }) => {
+                    let sent = shift_source_volume(delta_db).await;
                     let _ = events.send(AirplayEvent::VolumeSent { sent });
                 }
                 None => return,
@@ -269,27 +301,59 @@ async fn toggle() {
 }
 
 async fn run_action(action: &'static str) -> bool {
+    run_script(vec![action.to_owned()]).await.is_some()
+}
+
+async fn shift_source_volume(delta_db: f64) -> bool {
+    let Some(reply) = run_script(vec!["volume-get".to_owned()]).await else {
+        return false;
+    };
+    let Some(current) = parse_source_volume(&reply) else {
+        warn!("airplay: no source volume in the reply");
+        return false;
+    };
+    let level = shifted_source_volume(current, delta_db);
+    run_script(vec!["volume-set".to_owned(), format!("{level:.2}")])
+        .await
+        .is_some()
+}
+
+/// Ответ `dbus-send`: `variant       double -26.55`.
+fn parse_source_volume(reply: &str) -> Option<f64> {
+    reply.split_whitespace().last()?.parse().ok()
+}
+
+fn shifted_source_volume(current: f64, delta_db: f64) -> f64 {
+    (current.max(SOURCE_MIN_DB) + delta_db).clamp(SOURCE_MIN_DB, SOURCE_MAX_DB)
+}
+
+/// Stdout скрипта, если он завершился успешно.
+async fn run_script(args: Vec<String>) -> Option<String> {
+    let action = args.join(" ");
     let result = tokio::task::spawn_blocking(move || {
         Command::new("sh")
-            .args([ACTION_SCRIPT, action])
-            .stdout(Stdio::null())
+            .arg(ACTION_SCRIPT)
+            .args(args)
+            .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .output()
     })
     .await;
     match result {
-        Ok(Ok(status)) if status.success() => true,
-        Ok(Ok(status)) => {
-            warn!("airplay: {action} failed: {status}");
-            false
+        Ok(Ok(output)) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(Ok(output)) => {
+            warn!("airplay: {action} failed: {}", output.status);
+            None
         }
         Ok(Err(e)) => {
             warn!("airplay: {action} failed: {e}");
-            false
+            None
         }
         Err(e) => {
             warn!("airplay: {action} task failed: {e}");
-            false
+            None
         }
     }
 }
@@ -369,6 +433,23 @@ fn is_running(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_volume_comes_from_the_last_word_of_the_reply() {
+        let reply = "method return time=1.2 sender=:1.7 -> destination=:1.9 serial=4 reply_serial=2\n   variant       double -26.55\n";
+        assert_eq!(parse_source_volume(reply), Some(-26.55));
+        assert_eq!(parse_source_volume(""), None);
+        assert_eq!(parse_source_volume("variant string \"x\""), None);
+    }
+
+    #[test]
+    fn source_volume_stays_on_its_scale() {
+        assert_eq!(shifted_source_volume(-26.0, -1.5), -27.5);
+        assert_eq!(shifted_source_volume(-29.5, -2.0), -30.0);
+        assert_eq!(shifted_source_volume(-1.0, 3.0), 0.0);
+        // -144: звук выключен, отсчёт от низа шкалы.
+        assert_eq!(shifted_source_volume(-144.0, 2.0), -28.0);
+    }
 
     #[test]
     fn mute_goes_after_the_settings() {

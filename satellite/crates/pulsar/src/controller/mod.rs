@@ -72,12 +72,28 @@ const AIRPLAY_VOLUME_WAIT_MS: u64 = 800;
 /// Телефон отвечает и через секунду, особенно сразу после снятия паузы. Запись в усилитель мимо него
 /// слетела бы при следующем снятии паузы, а ползунок остался бы на месте: лучше подождать.
 const AIRPLAY_VOLUME_MAX_WAIT_MS: u64 = 2400;
+/// Точный уровень доходит до усилителя быстрее шага: он меняется уже в приёмнике.
+const AIRPLAY_EXACT_WAIT_MS: u64 = 300;
+/// Кривая источника неровная, но сдвига обычно хватает одного-двух.
+const AIRPLAY_EXACT_MAX_SHIFTS: u32 = 4;
 
 /// Громкость, которую должен применить источник AirPlay.
 #[derive(Clone, Copy)]
 enum AirplayVolume {
     Step(bool),
     Level(f32),
+}
+
+/// Идущая точная установка громкости через источник AirPlay.
+struct AirplayExactRun {
+    request: AirplayVolume,
+    target: i64,
+    /// Регулятор усилителя до последнего сдвига.
+    raw: i64,
+    delta_db: f64,
+    shifts: u32,
+    /// Сколько уже ждём отклика на последний сдвиг.
+    waited_ms: u64,
 }
 
 /// Идущие шаги громкости через источник AirPlay.
@@ -169,6 +185,7 @@ pub struct Controller {
     owner_light: OwnerLightHandle,
     /// Диалог поставил AirPlay на паузу и должен его вернуть.
     airplay_paused: bool,
+    airplay_exact: Option<AirplayExactRun>,
     airplay_run: Option<AirplayVolumeRun>,
     airplay_volume_after_dialog: Option<AirplayVolume>,
     /// Когда источник остановился: на паузе или сам.
@@ -596,6 +613,7 @@ impl Controller {
             airplay,
             owner_light,
             airplay_paused: false,
+            airplay_exact: None,
             airplay_run: None,
             airplay_volume_after_dialog: None,
             airplay_stopped_ms: None,

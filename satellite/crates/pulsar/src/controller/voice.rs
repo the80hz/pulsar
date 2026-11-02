@@ -173,6 +173,10 @@ impl Controller {
             );
             // Its command spotter would still act on "Алиса, громче" if it sounds or owns music.
             self.commands_blocked_until_ms = now_ms() + COMMAND_AFTER_WAKE_MS;
+            // После "Алиса, громче" паузы не будет, и музыка вернулась бы только по таймауту.
+            if command.is_empty() {
+                self.airplay.mute_until_closed();
+            }
             self.update_ui();
             return;
         }

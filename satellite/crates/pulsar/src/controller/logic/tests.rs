@@ -336,6 +336,33 @@ fn airplay_steps_do_not_mute_the_source() {
 }
 
 #[test]
+fn airplay_exact_target_stops_above_silence() {
+    assert_eq!(airplay_exact_target(165, 173), 173);
+    assert_eq!(airplay_exact_target(165, 158), 158);
+    // 0%: источник -144 выключил бы звук.
+    assert_eq!(airplay_exact_target(165, 0), 150);
+    assert_eq!(airplay_exact_target(146, 0), 146);
+}
+
+#[test]
+fn airplay_slope_comes_from_the_last_shift() {
+    assert_eq!(airplay_raw_per_db(158, 172, 1.75), Some(8.0));
+    assert_eq!(airplay_raw_per_db(172, 158, -1.75), Some(8.0));
+    // Малый сдвиг с округлением усилителя не должен дать резкого следующего шага.
+    assert_eq!(airplay_raw_per_db(165, 166, 1.0), Some(2.0));
+    assert_eq!(airplay_raw_per_db(165, 180, 0.5), Some(12.0));
+    // Уровень ушёл против сдвига: его двигает кто-то ещё.
+    assert_eq!(airplay_raw_per_db(165, 160, 1.0), None);
+    assert_eq!(airplay_raw_per_db(165, 165, 1.0), None);
+}
+
+#[test]
+fn airplay_first_slope_follows_the_phone_step() {
+    assert!((airplay_raw_per_db_estimate(165) - 8.53).abs() < 0.01);
+    assert!((airplay_raw_per_db_estimate(230) - 3.2).abs() < 0.01);
+}
+
+#[test]
 fn airplay_step_is_larger_at_the_bottom_of_the_scale() {
     assert_eq!(airplay_step_estimate(185), 16);
     assert_eq!(airplay_step_estimate(230), 6);
