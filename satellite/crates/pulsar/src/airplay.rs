@@ -20,6 +20,8 @@ const OUTPUT_HW_PARAMS: &str = "/proc/asound/card0/pcm0p/sub0/hw_params";
 const RELEASE_TIMEOUT: Duration = Duration::from_millis(3500);
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 const WATCH_PERIOD: Duration = Duration::from_secs(1);
+/// Шаг iPhone 1/16 шкалы, около 3 дБ в середине. Два дают примерно шаг голосовой команды.
+const VOLUME_STEPS: usize = 2;
 const RESET_RATE: u32 = 48_000;
 const RESET_CHANNELS: u32 = 2;
 const RESET_FRAME_BYTES: usize = 4;
@@ -31,6 +33,8 @@ const DSP_SAVED: &str = "/data/local/opt/ap2/etc/dsp.conf";
 const MUTE_LINES: &str = "#pulsar-mute\nmute=1\n";
 
 pub enum AirplayEvent {
+    /// Запрос громкости ушёл источнику. `sent`: приёмник его принял.
+    VolumeSent { up: bool, sent: bool },
     /// Пауза отработала. `closed`: выход свободен и такт захвата снова 48 кГц.
     Released { closed: bool },
 }
@@ -38,6 +42,7 @@ pub enum AirplayEvent {
 enum Cmd {
     Pause,
     Resume,
+    Volume { up: bool },
 }
 
 #[derive(Clone)]
@@ -56,8 +61,19 @@ impl AirplayHandle {
         true
     }
 
+    /// Играет ли музыка сейчас. Читает procfs, как `pause_if_playing`.
+    pub fn playing(&self) -> bool {
+        self.available && is_running(&read_status())
+    }
+
     pub fn resume(&self) {
         let _ = self.cmds.send(Cmd::Resume);
+    }
+
+    /// Шаг громкости через источник: ползунок на телефоне двигается, а его уровень не отменит
+    /// команду при следующем запуске потока. Идёт в очереди после паузы и её снятия.
+    pub fn step_volume(&self, up: bool) {
+        let _ = self.cmds.send(Cmd::Volume { up });
     }
 }
 
@@ -104,6 +120,10 @@ async fn run(
                     if std::mem::take(&mut muted) {
                         restore_dsp();
                     }
+                }
+                Some(Cmd::Volume { up }) => {
+                    let sent = send_volume(up).await;
+                    let _ = events.send(AirplayEvent::VolumeSent { up, sent });
                 }
                 None => return,
             },
@@ -207,19 +227,42 @@ async fn wait_closed() -> bool {
 }
 
 async fn toggle() {
-    let result = tokio::task::spawn_blocking(|| {
+    run_action("toggle").await;
+}
+
+async fn send_volume(up: bool) -> bool {
+    let action = if up { "volume-up" } else { "volume-down" };
+    for _ in 0..VOLUME_STEPS {
+        if !run_action(action).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn run_action(action: &'static str) -> bool {
+    let result = tokio::task::spawn_blocking(move || {
         Command::new("sh")
-            .args([ACTION_SCRIPT, "toggle"])
+            .args([ACTION_SCRIPT, action])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
     })
     .await;
     match result {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => warn!("airplay: toggle failed: {status}"),
-        Ok(Err(e)) => warn!("airplay: toggle failed: {e}"),
-        Err(e) => warn!("airplay: toggle task failed: {e}"),
+        Ok(Ok(status)) if status.success() => true,
+        Ok(Ok(status)) => {
+            warn!("airplay: {action} failed: {status}");
+            false
+        }
+        Ok(Err(e)) => {
+            warn!("airplay: {action} failed: {e}");
+            false
+        }
+        Err(e) => {
+            warn!("airplay: {action} task failed: {e}");
+            false
+        }
     }
 }
 

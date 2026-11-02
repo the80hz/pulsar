@@ -722,7 +722,11 @@ impl Controller {
         // A dialog past the window after its wake word: its words are the request's, except
         // "стоп".
         let in_dialog = matches!(self.phase, Phase::Listening | Phase::Processing) && !after_wake;
-        let sounding = self.phase == Phase::Speaking || self.announcing || self.timer_ringing;
+        // Музыка AirPlay идёт через тот же усилитель, «громче» и «тише» работают и для неё.
+        let sounding = self.phase == Phase::Speaking
+            || self.announcing
+            || self.timer_ringing
+            || self.airplay.playing();
         if !logic::command_allowed(
             c,
             held || after_wake,
@@ -749,6 +753,8 @@ impl Controller {
                 ""
             }
         );
+        // После wake-слова диалог уже поставил музыку на паузу.
+        let airplay_source = self.airplay_paused || self.airplay.playing();
         // Слово в окне самого диалога сначала завершает диалог; удержанное через арбитраж в
         // SPEAKING / IDLE оставляет ответ играть. Слово, распознанное уже после barge-in, отменяет
         // новый диалог; см. docs/voice.md, «Командный спотер».
@@ -782,7 +788,11 @@ impl Controller {
             VoiceCommand::Resume => self.music_resume(),
             VoiceCommand::Louder | VoiceCommand::Quieter => {
                 let up = c == VoiceCommand::Louder;
-                self.set_volume(pulsar_core::volume::step_alice(self.st.volume, up), true);
+                if airplay_source {
+                    self.airplay_volume_step(up);
+                } else {
+                    self.set_volume(pulsar_core::volume::step_alice(self.st.volume, up), true);
+                }
             }
             VoiceCommand::Next | VoiceCommand::Prev => {
                 let (t, shot) = if c == VoiceCommand::Next {

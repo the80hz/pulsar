@@ -1,13 +1,13 @@
 //! Volume, mute, ducking, the HA media player and the Sendspin hooks (controller.cpp "media").
 
-use log::debug;
+use log::{debug, info};
 use pulsar_core::{ClockShot, now_ms};
 use pulsar_esphome::{MediaCommand, MediaCommandRequest};
 use pulsar_media::{Channel, PlayState};
 use pulsar_sendspin::SendspinEvent;
 
 use super::logic::{self, cxx_max, cxx_min};
-use super::{Controller, DUCK_GAIN, Pending, SOUNDS};
+use super::{AIRPLAY_VOLUME_WAIT_MS, AMP_SYNC_MS, Controller, DUCK_GAIN, Pending, SOUNDS, Tk};
 
 impl Controller {
     pub(super) fn update_duck(&mut self) {
@@ -77,6 +77,54 @@ impl Controller {
         }
         self.publish_media();
         self.persist();
+    }
+
+    /// Громкость изменили мимо демона (ползунок AirPlay): показать её в HA и сохранить.
+    pub(super) fn sync_amp(&mut self) {
+        self.timers.set(Tk::AmpSync, AMP_SYNC_MS);
+        let Some(v) = self.mixer.take_external() else {
+            return;
+        };
+        self.st.volume = v;
+        self.st.muted = false;
+        if let Some(ss) = &self.sendspin {
+            ss.report_volume(self.st.volume, self.st.muted);
+        }
+        self.publish_media();
+        self.persist();
+    }
+
+    /// Уровень запоминается до запроса: источник может ответить раньше, чем запрос завершится.
+    pub(super) fn airplay_volume_step(&mut self, up: bool) {
+        self.sync_amp();
+        self.airplay_step = Some(self.st.volume);
+        self.airplay.step_volume(up);
+    }
+
+    pub(super) fn airplay_volume_sent(&mut self, up: bool, sent: bool) {
+        if sent {
+            self.airplay_step_up = up;
+            self.timers
+                .set(Tk::AirplayVolumeCheck, AIRPLAY_VOLUME_WAIT_MS);
+        } else {
+            self.airplay_step = None;
+            self.sync_amp();
+            let v = pulsar_core::volume::step_alice(self.st.volume, up);
+            self.set_volume(v, true);
+        }
+    }
+
+    /// Не каждый источник выполняет команду: без отклика шаг делается прямо на усилителе.
+    pub(super) fn airplay_volume_check(&mut self) {
+        let Some(before) = self.airplay_step.take() else {
+            return;
+        };
+        self.sync_amp();
+        if self.st.volume == before {
+            info!("airplay: source ignored the volume step");
+            let v = pulsar_core::volume::step_alice(self.st.volume, self.airplay_step_up);
+            self.set_volume(v, true);
+        }
     }
 
     /// Stock click after a local change (keys, voice words); `before` = (volume, muted) before it.

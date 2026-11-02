@@ -24,6 +24,8 @@ pub struct Mixer {
     ctl: Option<Ctl>,
     volume: f32,
     muted: bool,
+    /// Последнее значение, записанное демоном или замеченное им (`take_external`).
+    last_raw: i64,
 }
 
 impl Mixer {
@@ -36,7 +38,9 @@ impl Mixer {
             // No hardware master: the controller applies this gain to the player channels.
             volume: if model.software_volume { 0.1 } else { 0.5 },
             muted: false,
+            last_raw: -1,
         };
+        let control = mixer.control();
         if model.software_volume {
             info!("mixer: software volume");
             return mixer;
@@ -48,18 +52,19 @@ impl Mixer {
                 return mixer;
             }
         };
-        if !ctl.mixer_exists(MASTER) {
+        if !ctl.mixer_exists(control) {
             // Opening the softvol PCM once creates the control.
             drop(Pcm::open(model.playback_pcm, Stream::Playback, true));
-            if !ctl.mixer_exists(MASTER) {
-                error!("mixer: control '{MASTER}' not found");
+            if !ctl.mixer_exists(control) {
+                error!("mixer: control '{control}' not found");
                 return mixer;
             }
         }
-        if let Ok(raw) = ctl.read_integer(MASTER, 0) {
+        if let Ok(raw) = ctl.read_integer(control, 0) {
             if raw > 0 {
                 mixer.volume = from_raw(model, raw);
             }
+            mixer.last_raw = raw;
             info!("mixer: master raw={raw} -> volume {:.2}", mixer.volume);
         }
         mixer.ctl = Some(ctl);
@@ -91,20 +96,52 @@ impl Mixer {
         self.apply();
     }
 
-    fn apply(&self) {
+    fn control(&self) -> &'static str {
+        if self.model.amp_master.is_empty() {
+            MASTER
+        } else {
+            self.model.amp_master
+        }
+    }
+
+    /// Регулятор общий с другими плеерами (`Model::amp_master`): контроллеру надо его перечитывать.
+    pub fn shared(&self) -> bool {
+        !self.model.amp_master.is_empty() && self.ctl.is_some()
+    }
+
+    /// Новая громкость, если регулятор изменил кто-то другой (ползунок AirPlay).
+    pub fn take_external(&mut self) -> Option<f32> {
+        if !self.shared() {
+            return None;
+        }
+        let raw = self.ctl.as_ref()?.read_integer(self.control(), 0).ok()?;
+        if raw == self.last_raw {
+            return None;
+        }
+        self.last_raw = raw;
+        self.volume = from_raw(self.model, raw);
+        self.muted = false;
+        Some(self.volume)
+    }
+
+    fn apply(&mut self) {
+        let control = self.control();
         let Some(ctl) = &self.ctl else { return };
         let raw = if self.muted {
             0
         } else {
             to_raw(self.model, self.volume)
         };
-        match ctl.write_integers(MASTER, &[raw, raw]) {
+        match ctl.write_integers(control, &[raw, raw]) {
             Err(rc) => error!("mixer: write {raw}: {}", pulsar_alsa::strerror(rc)),
-            Ok(()) => debug!(
-                "mixer: volume {:.2} muted={} -> raw {raw}",
-                self.volume,
-                i32::from(self.muted)
-            ),
+            Ok(()) => {
+                debug!(
+                    "mixer: volume {:.2} muted={} -> raw {raw}",
+                    self.volume,
+                    i32::from(self.muted)
+                );
+                self.last_raw = raw;
+            }
         }
     }
 }

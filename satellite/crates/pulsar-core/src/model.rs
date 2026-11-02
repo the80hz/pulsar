@@ -84,6 +84,9 @@ pub struct Model {
     /// empty: the usual "libasound.so.2" lookup.
     pub alsa_lib: &'static str,
     pub software_volume: bool,
+    /// Регулятор усилителя на hw:0 вместо softvol "Master Playback Volume"; его же меняют другие
+    /// плееры на станции, поэтому контроллер перечитывает значение. Пусто: обычный "Master".
+    pub amp_master: &'static str,
     /// ALSA playback switch (on hw:0) that must be 1 (on) for the amplifier to pass audio; empty:
     /// no such control.
     pub spk_mute_ctl: &'static str,
@@ -239,6 +242,16 @@ const NO_STRIP: LedStrip = LedStrip {
 
 // { "0": 0, "1": 49, "20": 255 }: softvol min_dB -60, so 2.6 dB per level, level 1 at -48.5 dB.
 // The Lite 2's quasar.cfg has the same map.
+/// Те же децибелы, что у `STOCK_VOLUME` на softvol: шаг усилителя 0,5 дБ, raw 255 = 0 дБ.
+const STATION2_VOLUME: &[VolumePoint] = &[
+    VolumePoint { level: 0, raw: 0 },
+    VolumePoint { level: 1, raw: 158 },
+    VolumePoint {
+        level: 20,
+        raw: 255,
+    },
+];
+
 const STOCK_VOLUME: &[VolumePoint] = &[
     VolumePoint { level: 0, raw: 0 },
     VolumePoint { level: 1, raw: 49 },
@@ -308,6 +321,7 @@ static MIDI: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    amp_master: "",
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: STOCK_VOLUME,
@@ -370,6 +384,7 @@ static LITE2: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    amp_master: "",
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: STOCK_VOLUME,
@@ -440,6 +455,7 @@ static MINI2: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    amp_master: "",
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: MINI2_VOLUME,
@@ -505,6 +521,7 @@ static MINI: Model = Model {
     // No softvol "speakers" PCM and the hardware "Master" control does not attenuate the output;
     // Controller applies the volume to the GStreamer player channels instead.
     software_volume: true,
+    amp_master: "",
     spk_mute_ctl: "SPK mute",
     // The stock maind opens the tdm_state amplifier gates; without them the ALSA sink runs but the
     // speaker stays silent (SPK mute cannot be cleared while amp_table is 0). The driver clears
@@ -561,11 +578,12 @@ static STATION2: Model = Model {
     playback_pcm: "dmix_spk_plug",
     alsa_config: "",
     alsa_lib: "",
-    // Master also drives the amplifier through hardvold and must stay at 255.
-    software_volume: true,
+    // Одна шкала с AirPlay: Shairport и демон пишут в усилитель напрямую, минуя hardvold.
+    software_volume: false,
+    amp_master: "SY6045S Master Playback Volume",
     spk_mute_ctl: "",
     amp_enable_paths: &[],
-    volume_map: STOCK_VOLUME,
+    volume_map: STATION2_VOLUME,
     volume_min_step: true,
     has_lux: false,
     zigbee_tty: "",
@@ -633,6 +651,7 @@ static MINI3: Model = Model {
     alsa_config: "",
     alsa_lib: "",
     software_volume: false,
+    amp_master: "",
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: MINI3_VOLUME,
@@ -836,9 +855,24 @@ mod tests {
         assert_eq!(m.capture_channels, 16);
         assert_eq!(m.mic_channels, &[0, 2, 4, 6]);
         assert_eq!(m.spk_channels, &[8, 9]);
-        // Master drives the amplifier through hardvold: the daemon must not touch it.
-        assert!(m.software_volume);
+        assert!(!m.software_volume);
+        assert_eq!(m.amp_master, "SY6045S Master Playback Volume");
         assert!(!m.has_button_events());
+    }
+
+    #[test]
+    fn station2_scale_matches_the_software_curve() {
+        let m = model_from_compatible(b"yandex,station-midi\0amlogic, axg\0").unwrap();
+        let db = |raw: i64| (raw - 255) as f64 * 0.5;
+        // Прежняя громкость 0.1 шла программно на -45.9 дБ: при переходе уровень не прыгает.
+        assert!((db(crate::volume::to_raw(m, 0.1)) + 46.0).abs() < 0.5);
+        assert_eq!(crate::volume::to_raw(m, 0.0), 0);
+        assert_eq!(crate::volume::to_raw(m, 1.0), 255);
+        for v in [0.1f32, 0.3, 0.5, 0.9] {
+            let back = crate::volume::from_raw(m, crate::volume::to_raw(m, v));
+            assert!((back - v).abs() < 0.01, "{v} -> {back}");
+        }
+        assert_eq!(crate::volume::master_gain(m, 0.1), 1.0);
     }
 
     #[test]

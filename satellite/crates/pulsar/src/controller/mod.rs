@@ -65,6 +65,11 @@ pub enum ExitReason {
     Updated,
 }
 
+/// Частота опроса усилителя: ползунок AirPlay меняет его в обход демона.
+const AMP_SYNC_MS: u64 = 1000;
+/// Сколько ждать, пока источник AirPlay вернёт новую громкость.
+const AIRPLAY_VOLUME_WAIT_MS: u64 = 800;
+
 /// Loop timers of the C++ controller. Intended difference: C++ armed an independent timer on
 /// every call, so with two error rings pending update_ui ran at the earlier deadline (and again
 /// at the later one); here a re-arm of `UiAfterNotSubscribed` / `UiAfterError` moves the
@@ -81,6 +86,10 @@ enum Tk {
     TimerTick,
     /// Next round of the timer ring.
     RingTick,
+    /// Перечитать общий с AirPlay регулятор усилителя.
+    AmpSync,
+    /// Источник AirPlay должен был ответить на шаг громкости.
+    AirplayVolumeCheck,
     UpdateCheck,
     /// An automatic install waits for idle.
     UpdateRetry,
@@ -138,6 +147,9 @@ pub struct Controller {
     owner_light: OwnerLightHandle,
     /// Диалог поставил AirPlay на паузу и должен его вернуть.
     airplay_paused: bool,
+    /// Шаг громкости ушёл источнику AirPlay: громкость до него.
+    airplay_step: Option<f32>,
+    airplay_step_up: bool,
     /// Выход ещё занят AirPlay: ответ ждёт его освобождения.
     airplay_wait: bool,
     /// Ответ пришёл во время ожидания и сыграется после `AirplayEvent::Released`.
@@ -556,6 +568,8 @@ impl Controller {
             airplay,
             owner_light,
             airplay_paused: false,
+            airplay_step: None,
+            airplay_step_up: false,
             airplay_wait: false,
             tts_held: false,
             _input: input,
@@ -661,6 +675,9 @@ impl Controller {
     /// queued) keeps it: the new binary clears it. A settings change still pending is written by
     /// `flush_settings` afterwards.
     pub async fn run(&mut self) -> ExitReason {
+        if self.mixer.shared() {
+            self.timers.set(Tk::AmpSync, AMP_SYNC_MS);
+        }
         let reason = loop {
             if let Some(r) = self.exit.take() {
                 break r;
@@ -701,6 +718,9 @@ impl Controller {
                 },
                 ev = recv(&mut self.rx.airplay) => match ev {
                     Some(AirplayEvent::Released { closed }) => self.airplay_released(closed),
+                    Some(AirplayEvent::VolumeSent { up, sent }) => {
+                        self.airplay_volume_sent(up, sent);
+                    }
                     None => self.rx.airplay = None,
                 },
                 ev = recv(&mut self.rx.input) => match ev {
@@ -754,6 +774,8 @@ impl Controller {
             Tk::Watchdog => self.abort_dialog("no progress from Home Assistant, giving up"),
             Tk::TimerTick => self.show_timers(),
             Tk::RingTick => self.ring_timer(),
+            Tk::AmpSync => self.sync_amp(),
+            Tk::AirplayVolumeCheck => self.airplay_volume_check(),
             Tk::UpdateCheck => self.check_update(),
             Tk::UpdateRetry => self.maybe_auto_update(),
             // exit 0: supervise.sh starts the new binary
