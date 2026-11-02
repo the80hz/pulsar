@@ -1,13 +1,17 @@
 //! Volume, mute, ducking, the HA media player and the Sendspin hooks (controller.cpp "media").
 
 use log::{debug, info};
+use pulsar_core::volume;
 use pulsar_core::{ClockShot, now_ms};
 use pulsar_esphome::{MediaCommand, MediaCommandRequest};
 use pulsar_media::{Channel, PlayState};
 use pulsar_sendspin::SendspinEvent;
 
-use super::logic::{self, cxx_max, cxx_min};
-use super::{AIRPLAY_VOLUME_WAIT_MS, AMP_SYNC_MS, Controller, DUCK_GAIN, Pending, SOUNDS, Tk};
+use super::logic::{self, AirplayState, cxx_max, cxx_min};
+use super::{
+    AIRPLAY_VOLUME_MAX_WAIT_MS, AIRPLAY_VOLUME_WAIT_MS, AMP_SYNC_MS, AirplayVolume,
+    AirplayVolumeRun, Controller, DUCK_GAIN, Pending, SOUNDS, Tk,
+};
 
 impl Controller {
     pub(super) fn update_duck(&mut self) {
@@ -82,9 +86,14 @@ impl Controller {
     /// Громкость изменили мимо демона (ползунок AirPlay): показать её в HA и сохранить.
     pub(super) fn sync_amp(&mut self) {
         self.timers.set(Tk::AmpSync, AMP_SYNC_MS);
+        self.sync_airplay_state();
         let Some(v) = self.mixer.take_external() else {
             return;
         };
+        info!(
+            "amplifier changed outside the daemon: raw {}",
+            self.mixer.raw()
+        );
         self.st.volume = v;
         self.st.muted = false;
         if let Some(ss) = &self.sendspin {
@@ -94,36 +103,183 @@ impl Controller {
         self.persist();
     }
 
-    /// Уровень запоминается до запроса: источник может ответить раньше, чем запрос завершится.
-    pub(super) fn airplay_volume_step(&mut self, up: bool) {
-        self.sync_amp();
-        self.airplay_step = Some(self.st.volume);
-        self.airplay.step_volume(up);
-    }
-
-    pub(super) fn airplay_volume_sent(&mut self, up: bool, sent: bool) {
-        if sent {
-            self.airplay_step_up = up;
-            self.timers
-                .set(Tk::AirplayVolumeCheck, AIRPLAY_VOLUME_WAIT_MS);
-        } else {
-            self.airplay_step = None;
-            self.sync_amp();
-            let v = pulsar_core::volume::step_alice(self.st.volume, up);
-            self.set_volume(v, true);
+    /// Источник остановился сам (телефон) или отпустил паузу: показать это в HA.
+    fn sync_airplay_state(&mut self) {
+        let playing = self.airplay.playing();
+        if playing {
+            self.airplay_stopped_ms = None;
+        } else if self.airplay_was_playing && !self.airplay_paused {
+            self.airplay_stopped_ms = Some(now_ms());
+        }
+        self.airplay_was_playing = playing;
+        let state = self.airplay_state();
+        if state != self.airplay_published {
+            self.publish_media();
         }
     }
 
-    /// Не каждый источник выполняет команду: без отклика шаг делается прямо на усилителе.
+    pub(super) fn airplay_state(&self) -> AirplayState {
+        if self.airplay_paused || self.airplay.playing() {
+            AirplayState::Playing
+        } else if self
+            .airplay_stopped_ms
+            .is_some_and(|t| now_ms() - t < logic::PAUSED_MUSIC_MS)
+        {
+            AirplayState::Paused
+        } else {
+            AirplayState::None
+        }
+    }
+
+    /// Музыкой сейчас распоряжается телефон: и громкость, и транспорт идут через него. Своя музыка
+    /// HA и Sendspin важнее.
+    pub(super) fn airplay_source(&self) -> bool {
+        self.airplay_state() != AirplayState::None
+            && !self.sendspin_streaming()
+            && !matches!(
+                self.player.state(Channel::Music),
+                PlayState::Playing | PlayState::Loading | PlayState::Paused
+            )
+    }
+
+    /// True, если музыка играла. Пауза диалога просто остаётся, снимать её будет некому.
+    pub(super) fn airplay_pause(&mut self) -> bool {
+        if std::mem::take(&mut self.airplay_paused) {
+            self.airplay.keep_paused();
+        } else if self.airplay.playing() {
+            self.airplay.pause();
+        } else {
+            return false;
+        }
+        self.airplay_stopped_ms = Some(now_ms());
+        true
+    }
+
+    /// Команды HA для музыки телефона. True: команда обработана.
+    fn airplay_command(&mut self, c: MediaCommand) -> bool {
+        if !self.airplay_source() {
+            return false;
+        }
+        let paused = self.airplay_state() == AirplayState::Paused;
+        match c {
+            MediaCommand::Pause | MediaCommand::Stop => {
+                if self.airplay_pause() {
+                    self.clock.play(ClockShot::Pause);
+                }
+            }
+            MediaCommand::Play | MediaCommand::Toggle if paused => {
+                self.airplay_stopped_ms = None;
+                self.airplay.play();
+            }
+            // Паузу диалога снимет конец диалога.
+            MediaCommand::Play => {}
+            MediaCommand::Toggle => {
+                if self.airplay_pause() {
+                    self.clock.play(ClockShot::Pause);
+                }
+            }
+            MediaCommand::VolumeUp | MediaCommand::VolumeDown => {
+                self.airplay_volume(AirplayVolume::Step(c == MediaCommand::VolumeUp));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// На время диалога источник на паузе, а его снятие вернёт прежний уровень: команда ждёт конца
+    /// диалога и идёт в очереди после снятия.
+    pub(super) fn airplay_volume(&mut self, volume: AirplayVolume) {
+        if self.airplay_paused {
+            self.airplay_volume_after_dialog = Some(volume);
+            return;
+        }
+        self.sync_amp();
+        let raw = self.mixer.raw();
+        let target = match volume {
+            AirplayVolume::Step(true) => raw + logic::AIRPLAY_WORD_RAW,
+            AirplayVolume::Step(false) => raw - logic::AIRPLAY_WORD_RAW,
+            AirplayVolume::Level(v) => volume::to_raw(self.model, v),
+        };
+        let Some(up) = logic::airplay_next_step(raw, target, logic::airplay_step_estimate(raw))
+        else {
+            info!("airplay volume: stays at {raw}, target {target}");
+            return;
+        };
+        info!("airplay volume: from {raw} to {target}");
+        // Уровень запоминается до запроса: источник может ответить раньше, чем запрос завершится.
+        self.airplay_run = Some(AirplayVolumeRun {
+            request: volume,
+            target,
+            up,
+            raw,
+            steps: 0,
+            waited_ms: 0,
+        });
+        self.airplay.step_volume(up);
+    }
+
+    /// Запасной путь, если источник не выполнил команду: прямо на усилителе.
+    fn airplay_volume_direct(&mut self, request: AirplayVolume) {
+        match request {
+            AirplayVolume::Level(v) => self.set_volume(v, false),
+            AirplayVolume::Step(up) => {
+                let v = volume::step_alice(self.st.volume, up);
+                self.set_volume(v, true);
+            }
+        }
+    }
+
+    pub(super) fn airplay_volume_sent(&mut self, sent: bool) {
+        if sent {
+            self.timers
+                .set(Tk::AirplayVolumeCheck, AIRPLAY_VOLUME_WAIT_MS);
+        } else if let Some(run) = self.airplay_run.take() {
+            self.sync_amp();
+            // Часть шагов уже прошла: усилитель не трогаем, источник вернул бы свой уровень.
+            if run.steps == 0 {
+                self.airplay_volume_direct(run.request);
+            }
+        }
+    }
+
+    /// Шаг телефона неравномерен, поэтому идём по одному и смотрим на усилитель. Не каждый источник
+    /// выполняет команду: без отклика на первый шаг он делается прямо на усилителе.
     pub(super) fn airplay_volume_check(&mut self) {
-        let Some(before) = self.airplay_step.take() else {
+        let Some(mut run) = self.airplay_run.take() else {
             return;
         };
         self.sync_amp();
-        if self.st.volume == before {
-            info!("airplay: source ignored the volume step");
-            let v = pulsar_core::volume::step_alice(self.st.volume, self.airplay_step_up);
-            self.set_volume(v, true);
+        let raw = self.mixer.raw();
+        if raw == run.raw {
+            run.waited_ms += AIRPLAY_VOLUME_WAIT_MS;
+            if run.waited_ms < AIRPLAY_VOLUME_MAX_WAIT_MS {
+                self.airplay_run = Some(run);
+                self.timers
+                    .set(Tk::AirplayVolumeCheck, AIRPLAY_VOLUME_WAIT_MS);
+                return;
+            }
+            info!("airplay: source ignored the volume step {}", run.steps);
+            if run.steps == 0 {
+                self.airplay_volume_direct(run.request);
+            }
+            return;
+        }
+        run.steps += 1;
+        let step_raw = (raw - run.raw).abs();
+        let next = logic::airplay_next_step(raw, run.target, step_raw);
+        // Смена направления значила бы проскочить цель и вернуться на тот же уровень.
+        if run.steps < logic::AIRPLAY_MAX_STEPS && next == Some(run.up) {
+            info!("airplay volume: {raw} after step {}", run.steps);
+            run.raw = raw;
+            run.waited_ms = 0;
+            let up = run.up;
+            self.airplay_run = Some(run);
+            self.airplay.step_volume(up);
+        } else {
+            info!(
+                "airplay volume: done at {raw}, target {}, {} step(s)",
+                run.target, run.steps
+            );
         }
     }
 
@@ -147,11 +303,13 @@ impl Controller {
 
     /// Reads the player state as it is now: right after a command to the player it is still the
     /// previous one (as in C++); the change comes as `PlayerEvent::State`, which publishes again.
-    pub(super) fn publish_media(&self) {
+    pub(super) fn publish_media(&mut self) {
+        self.airplay_published = self.airplay_state();
         let s = logic::media_state(
             self.announcing,
             self.player.state(Channel::Music),
             self.sendspin_streaming(),
+            self.airplay_published,
         );
         self.api.publish_media(s, self.st.volume, self.st.muted);
         self.update_music();
@@ -190,9 +348,15 @@ impl Controller {
             }
         }
         if let Some(v) = cmd.volume {
-            self.set_volume(v, false);
+            if self.airplay_source() {
+                self.airplay_volume(AirplayVolume::Level(v));
+            } else {
+                self.set_volume(v, false);
+            }
         }
-        if let Some(c) = cmd.command {
+        if let Some(c) = cmd.command
+            && !self.airplay_command(c)
+        {
             let ss_on = self.sendspin_streaming();
             let music = || self.player.state(Channel::Music);
             match c {

@@ -40,6 +40,7 @@ fn selftest(compilation_time: &str) -> (DeviceIdentity, ApiConfig) {
         has_wake_preroll: true,
         has_hw_mic_mute: true,
         has_buttons: true,
+        has_track_buttons: false,
         has_auto_brightness: true,
         key_path: None,
     };
@@ -641,6 +642,7 @@ async fn states_go_to_subscribers_and_zigbee_entities_need_modes() {
             assert!(!keys.contains(&key::SELECT_ZIGBEE_MODE));
             assert!(!keys.contains(&key::TEXT_ZIGBEE));
             assert!(!keys.contains(&key::BUTTON_ZIGBEE_JOIN));
+            assert!(!keys.contains(&key::BUTTON_NEXT_TRACK));
             p.send(msg::SUBSCRIBE_STATES_REQ, &Writer::new()).await;
             let states = p.sync().await;
             // Cached value replayed; no Zigbee states.
@@ -904,6 +906,42 @@ async fn eof_with_pending_batch_still_answers_everything() {
                 }
             }
             assert_eq!(done, 300);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn track_buttons_exist_only_with_an_outside_source() {
+    local()
+        .run_until(async {
+            let (id, mut cfg) = selftest("now");
+            cfg.has_track_buttons = true;
+            let (_h, mut rx, port) = start_with(id, cfg);
+            let mut p = Peer::connect(port).await;
+            p.hello("HA").await;
+            event(&mut rx).await;
+            p.send(msg::LIST_ENTITIES_REQ, &Writer::new()).await;
+            let mut keys = Vec::new();
+            loop {
+                let (t, m) = p.recv().await.unwrap();
+                if t == msg::LIST_DONE {
+                    break;
+                }
+                keys.push(field(&m, 2).unwrap().u32());
+            }
+            assert!(keys.contains(&key::BUTTON_NEXT_TRACK));
+            assert!(keys.contains(&key::BUTTON_PREVIOUS_TRACK));
+            p.send(msg::BUTTON_CMD, &kv(key::BUTTON_NEXT_TRACK, |_| {}))
+                .await;
+            p.send(msg::BUTTON_CMD, &kv(key::BUTTON_PREVIOUS_TRACK, |_| {}))
+                .await;
+            assert_eq!(
+                drain(&mut p, &mut rx).await,
+                [
+                    ApiEvent::Button(ButtonId::NextTrack),
+                    ApiEvent::Button(ButtonId::PreviousTrack)
+                ]
+            );
         })
         .await;
 }

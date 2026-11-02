@@ -105,6 +105,11 @@ impl Mixer {
     }
 
     /// Регулятор общий с другими плеерами (`Model::amp_master`): контроллеру надо его перечитывать.
+    /// Последнее прочитанное или записанное значение регулятора.
+    pub fn raw(&self) -> i64 {
+        self.last_raw
+    }
+
     pub fn shared(&self) -> bool {
         !self.model.amp_master.is_empty() && self.ctl.is_some()
     }

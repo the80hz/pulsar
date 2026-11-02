@@ -69,6 +69,28 @@ pub enum ExitReason {
 const AMP_SYNC_MS: u64 = 1000;
 /// Сколько ждать, пока источник AirPlay вернёт новую громкость.
 const AIRPLAY_VOLUME_WAIT_MS: u64 = 800;
+/// Телефон отвечает и через секунду, особенно сразу после снятия паузы. Запись в усилитель мимо него
+/// слетела бы при следующем снятии паузы, а ползунок остался бы на месте: лучше подождать.
+const AIRPLAY_VOLUME_MAX_WAIT_MS: u64 = 2400;
+
+/// Громкость, которую должен применить источник AirPlay.
+#[derive(Clone, Copy)]
+enum AirplayVolume {
+    Step(bool),
+    Level(f32),
+}
+
+/// Идущие шаги громкости через источник AirPlay.
+struct AirplayVolumeRun {
+    request: AirplayVolume,
+    target: i64,
+    up: bool,
+    /// Регулятор усилителя до последнего шага.
+    raw: i64,
+    steps: u32,
+    /// Сколько уже ждём отклика на последний шаг.
+    waited_ms: u64,
+}
 
 /// Loop timers of the C++ controller. Intended difference: C++ armed an independent timer on
 /// every call, so with two error rings pending update_ui ran at the earlier deadline (and again
@@ -147,9 +169,14 @@ pub struct Controller {
     owner_light: OwnerLightHandle,
     /// Диалог поставил AirPlay на паузу и должен его вернуть.
     airplay_paused: bool,
-    /// Шаг громкости ушёл источнику AirPlay: громкость до него.
-    airplay_step: Option<f32>,
-    airplay_step_up: bool,
+    airplay_run: Option<AirplayVolumeRun>,
+    airplay_volume_after_dialog: Option<AirplayVolume>,
+    /// Когда источник остановился: на паузе или сам.
+    airplay_stopped_ms: Option<i64>,
+    airplay_was_playing: bool,
+    airplay_published: logic::AirplayState,
+    /// Когда услышан wake word. Без HA диалог не начнётся, а команды работать должны.
+    wake_heard_ms: i64,
     /// Выход ещё занят AirPlay: ответ ждёт его освобождения.
     airplay_wait: bool,
     /// Ответ пришёл во время ожидания и сыграется после `AirplayEvent::Released`.
@@ -366,6 +393,7 @@ impl Controller {
             has_wake_preroll: !model.wake_preroll.is_empty(),
             has_hw_mic_mute: !model.mute_input.is_empty() || model.mute_gpio != 0,
             has_buttons: model.has_button_events(),
+            has_track_buttons: airplay::receiver_installed(),
             key_path: Some(logic::in_dir(&dir, "api_key")),
             has_auto_brightness: lux_rx.is_some(),
         };
@@ -568,8 +596,12 @@ impl Controller {
             airplay,
             owner_light,
             airplay_paused: false,
-            airplay_step: None,
-            airplay_step_up: false,
+            airplay_run: None,
+            airplay_volume_after_dialog: None,
+            airplay_stopped_ms: None,
+            airplay_was_playing: false,
+            airplay_published: logic::AirplayState::None,
+            wake_heard_ms: 0,
             airplay_wait: false,
             tts_held: false,
             _input: input,
@@ -718,9 +750,7 @@ impl Controller {
                 },
                 ev = recv(&mut self.rx.airplay) => match ev {
                     Some(AirplayEvent::Released { closed }) => self.airplay_released(closed),
-                    Some(AirplayEvent::VolumeSent { up, sent }) => {
-                        self.airplay_volume_sent(up, sent);
-                    }
+                    Some(AirplayEvent::VolumeSent { sent }) => self.airplay_volume_sent(sent),
                     None => self.rx.airplay = None,
                 },
                 ev = recv(&mut self.rx.input) => match ev {
@@ -817,7 +847,14 @@ impl Controller {
                 // After on_wake has switched streaming on where the wake word starts a request.
                 self.mic.wake_handled();
             }
-            FrontendEvent::Command { word } => self.on_command(&word, false),
+            FrontendEvent::Command { word, followed } => {
+                if followed {
+                    // Запрос целиком дойдёт до HA.
+                    info!("voice command '{word}' ignored: part of a longer phrase");
+                } else {
+                    self.on_command(&word, false);
+                }
+            }
             FrontendEvent::Audio(pcm) => {
                 if self.phase == Phase::Listening {
                     self.api.voice_send_audio(pcm);

@@ -251,7 +251,7 @@ async fn run(m: &'static Model, a: Args) -> std::io::Result<bool> {
                     );
                     h.wake_handled();
                 }
-                Some(FrontendEvent::Command { word }) => {
+                Some(FrontendEvent::Command { word, .. }) => {
                     commands += 1;
                     out!("t={:6.2}s COMMAND '{word}'", secs(start));
                 }

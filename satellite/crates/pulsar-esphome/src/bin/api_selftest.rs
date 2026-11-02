@@ -307,6 +307,7 @@ async fn run(port: u16, name: String, run_s: i64, key_path: Option<PathBuf>) -> 
         has_wake_preroll: true,
         has_hw_mic_mute: true,
         has_buttons: true,
+        has_track_buttons: false,
         has_auto_brightness: true,
         key_path,
     };

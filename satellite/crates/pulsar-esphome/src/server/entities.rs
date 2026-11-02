@@ -47,6 +47,8 @@ pub(super) mod key {
     pub const SELECT_CLOCK_MUSIC: u32 = 31;
     pub const SW_WAKE_PREROLL: u32 = 32;
     pub const SW_CLOCK_AUTO_BRI: u32 = 33;
+    pub const BUTTON_NEXT_TRACK: u32 = 34;
+    pub const BUTTON_PREVIOUS_TRACK: u32 = 35;
 }
 
 /// aioesphomeapi VoiceAssistantFeature: voice assistant, API audio, timers, announce, start
@@ -466,6 +468,27 @@ impl Server {
         w.u32(7, ENTITY_CATEGORY_CONFIG, false);
         w.str(8, "restart", false);
         out.push((msg::LIST_BUTTON, w));
+        if self.cfg.has_track_buttons {
+            for (oid, k, name, icon) in [
+                (
+                    "next_track",
+                    key::BUTTON_NEXT_TRACK,
+                    "Next track",
+                    "mdi:skip-next",
+                ),
+                (
+                    "previous_track",
+                    key::BUTTON_PREVIOUS_TRACK,
+                    "Previous track",
+                    "mdi:skip-previous",
+                ),
+            ] {
+                let mut w = Writer::new();
+                entity_head(&mut w, oid, k, name);
+                w.str(5, icon, false);
+                out.push((msg::LIST_BUTTON, w));
+            }
+        }
         let sensor = |oid, key, name, unit, class, state_class| {
             let mut w = Writer::new();
             entity_head(&mut w, oid, key, name);

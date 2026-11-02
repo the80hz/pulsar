@@ -10,9 +10,10 @@ use pulsar_lan::arbiter::Claim;
 use pulsar_media::{Channel, PlayState};
 use pulsar_sendspin::Transport;
 
-use super::logic::{self, COMMAND_AFTER_WAKE_MS, HaTimer, Phase, VoiceCommand};
+use super::logic::{self, COMMAND_AFTER_WAKE_MS, COMMAND_TAIL_MS, HaTimer, Phase, VoiceCommand};
 use super::{
-    Controller, LISTEN_TIMEOUT_MS, PROCESS_TIMEOUT_MS, Pending, SOUNDS, TIMER_RING_MAX_MS, Tk,
+    AirplayVolume, Controller, LISTEN_TIMEOUT_MS, PROCESS_TIMEOUT_MS, Pending, SOUNDS,
+    TIMER_RING_MAX_MS, Tk,
 };
 
 impl Controller {
@@ -112,6 +113,7 @@ impl Controller {
             return;
         }
         info!("wake word '{phrase}', level {level_db:.1} dB");
+        self.wake_heard_ms = now_ms();
         if self.timer_ringing {
             // The wake word works as a stop word while ringing. A ringing station takes the
             // turn so that its neighbours do not start a dialog.
@@ -408,6 +410,9 @@ impl Controller {
         if std::mem::take(&mut self.airplay_paused) {
             self.airplay.resume();
         }
+        if let Some(volume) = self.airplay_volume_after_dialog.take() {
+            self.airplay_volume(volume);
+        }
         self.run.awaiting_run_start = false;
         self.send_tts_report(false);
         self.mic.set_streaming(self.arbitrating);
@@ -674,8 +679,8 @@ impl Controller {
 
     /// True when something was playing. Reads the player and Sendspin states before the
     /// commands (neither changes them synchronously, as in C++).
-    fn music_pause(&self) -> bool {
-        let mut paused = false;
+    fn music_pause(&mut self) -> bool {
+        let mut paused = self.airplay_pause();
         if matches!(
             self.player.state(Channel::Music),
             PlayState::Playing | PlayState::Loading
@@ -692,9 +697,12 @@ impl Controller {
         paused
     }
 
-    fn music_resume(&self) {
+    fn music_resume(&mut self) {
         if self.player.state(Channel::Music) == PlayState::Paused {
             self.player.resume(Channel::Music);
+        } else if self.airplay_state() == logic::AirplayState::Paused {
+            self.airplay_stopped_ms = None;
+            self.airplay.play();
         } else if let Some(ss) = &self.sendspin {
             ss.transport(Transport::Play);
         }
@@ -718,7 +726,16 @@ impl Controller {
             info!("voice command '{word}' held until the wake arbitration ends");
             return;
         }
-        let after_wake = logic::after_wake(self.phase, now_ms(), self.listen_started_ms);
+        let wake_only = self.model.wake_only_commands;
+        let tail = if wake_only { COMMAND_TAIL_MS } else { 0 };
+        let after_wake = logic::after_wake(self.phase, now_ms(), self.listen_started_ms - tail);
+        // Wake word прозвучал, но диалог не начался: например, HA недоступен.
+        let wake_without_dialog = self.phase == Phase::Idle
+            && now_ms() - self.wake_heard_ms < COMMAND_AFTER_WAKE_MS + tail;
+        if wake_only && !(held || after_wake || wake_without_dialog) {
+            info!("voice command '{word}' ignored: no wake word");
+            return;
+        }
         // A dialog past the window after its wake word: its words are the request's, except
         // "стоп".
         let in_dialog = matches!(self.phase, Phase::Listening | Phase::Processing) && !after_wake;
@@ -729,7 +746,7 @@ impl Controller {
             || self.airplay.playing();
         if !logic::command_allowed(
             c,
-            held || after_wake,
+            held || after_wake || wake_without_dialog,
             in_dialog,
             sounding,
             self.owns_music(),
@@ -753,8 +770,12 @@ impl Controller {
                 ""
             }
         );
-        // После wake-слова диалог уже поставил музыку на паузу.
-        let airplay_source = self.airplay_paused || self.airplay.playing();
+        // После wake-слова диалог уже поставил музыку на паузу. Её пауза сама по себе ничего не
+        // значит: «стоп» и «пауза» должны оставить её после конца диалога.
+        let airplay_source = self.airplay_source();
+        let kept_paused = after_wake
+            && matches!(c, VoiceCommand::Stop | VoiceCommand::Pause)
+            && self.airplay_pause();
         // Слово в окне самого диалога сначала завершает диалог; удержанное через арбитраж в
         // SPEAKING / IDLE оставляет ответ играть. Слово, распознанное уже после barge-in, отменяет
         // новый диалог; см. docs/voice.md, «Командный спотер».
@@ -775,13 +796,13 @@ impl Controller {
                     self.interrupt_speech();
                     self.update_duck();
                     self.update_ui();
-                } else if self.music_pause() {
+                } else if self.music_pause() || kept_paused {
                     // «стоп» = пауза, как в стоке; см. docs/voice.md, «Командный спотер».
                     self.clock.play(ClockShot::Pause);
                 }
             }
             VoiceCommand::Pause => {
-                if self.music_pause() {
+                if self.music_pause() || kept_paused {
                     self.clock.play(ClockShot::Pause);
                 }
             }
@@ -789,7 +810,7 @@ impl Controller {
             VoiceCommand::Louder | VoiceCommand::Quieter => {
                 let up = c == VoiceCommand::Louder;
                 if airplay_source {
-                    self.airplay_volume_step(up);
+                    self.airplay_volume(AirplayVolume::Step(up));
                 } else {
                     self.set_volume(pulsar_core::volume::step_alice(self.st.volume, up), true);
                 }
@@ -800,10 +821,13 @@ impl Controller {
                 } else {
                     (Transport::Previous, ClockShot::Previous)
                 };
-                if self.sendspin.as_ref().is_some_and(|ss| ss.transport(t)) {
+                let next = c == VoiceCommand::Next;
+                if self.sendspin.as_ref().is_some_and(|ss| ss.transport(t))
+                    || self.airplay.skip(next)
+                {
                     self.clock.play(shot);
                 } else {
-                    info!("'{word}' ignored: no Sendspin queue to skip in");
+                    info!("'{word}' ignored: no queue to skip in");
                 }
             }
         }

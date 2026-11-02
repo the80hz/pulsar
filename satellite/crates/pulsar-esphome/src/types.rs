@@ -69,6 +69,9 @@ pub struct ApiConfig {
     pub has_hw_mic_mute: bool,
     /// The model has the action button and volume keys (the Event «Button» entity).
     pub has_buttons: bool,
+    /// На станции есть внешний источник музыки: кнопки «Next track» и «Previous track». В медиаплеере
+    /// ESPHome API команд смены трека нет.
+    pub has_track_buttons: bool,
     /// File holding the Noise encryption key (base64 of 32 bytes, as ESPHome's `api: encryption:
     /// key`). Missing or empty file: plaintext (and provisioning with the all-zeros key). HA may
     /// set or rotate it with NoiseEncryptionSetKeyRequest. None: encryption unsupported.
@@ -92,6 +95,7 @@ impl Default for ApiConfig {
             has_wake_preroll: true,
             has_hw_mic_mute: true,
             has_buttons: true,
+            has_track_buttons: false,
             has_auto_brightness: true,
             key_path: None,
         }
@@ -312,6 +316,8 @@ pub enum SelectId {
 pub enum ButtonId {
     ZigbeeJoin = 1,
     ZigbeeLeave = 2,
+    NextTrack = 3,
+    PreviousTrack = 4,
 }
 
 #[repr(u32)]

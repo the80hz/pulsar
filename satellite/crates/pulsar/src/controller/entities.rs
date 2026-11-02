@@ -290,6 +290,12 @@ impl Controller {
     }
 
     fn on_button(&mut self, id: ButtonId) {
+        if matches!(id, ButtonId::NextTrack | ButtonId::PreviousTrack) {
+            let next = id == ButtonId::NextTrack;
+            info!("track button: next {next}");
+            self.airplay.skip(next);
+            return;
+        }
         let Some(z) = &self.zigbee else {
             return;
         };
@@ -300,6 +306,7 @@ impl Controller {
         match id {
             ButtonId::ZigbeeJoin => z.join(),
             ButtonId::ZigbeeLeave => z.leave(),
+            ButtonId::NextTrack | ButtonId::PreviousTrack => {}
         }
     }
 

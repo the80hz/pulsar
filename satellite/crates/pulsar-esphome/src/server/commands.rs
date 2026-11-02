@@ -171,6 +171,16 @@ impl Server {
             self.emit(ApiEvent::Button(b));
             return true;
         }
+        if k == key::BUTTON_NEXT_TRACK || k == key::BUTTON_PREVIOUS_TRACK {
+            if self.cfg.has_track_buttons {
+                self.emit(ApiEvent::Button(if k == key::BUTTON_NEXT_TRACK {
+                    ButtonId::NextTrack
+                } else {
+                    ButtonId::PreviousTrack
+                }));
+            }
+            return true;
+        }
         if k != key::BUTTON_RESTART {
             return true;
         }

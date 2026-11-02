@@ -87,6 +87,9 @@ pub struct Model {
     /// Регулятор усилителя на hw:0 вместо softvol "Master Playback Volume"; его же меняют другие
     /// плееры на станции, поэтому контроллер перечитывает значение. Пусто: обычный "Master".
     pub amp_master: &'static str,
+    /// Командные слова действуют только сразу после wake word и только если на них фраза кончилась:
+    /// модель команд срабатывает и на случайный разговор. Иначе слова слышны всегда, как в стоке.
+    pub wake_only_commands: bool,
     /// ALSA playback switch (on hw:0) that must be 1 (on) for the amplifier to pass audio; empty:
     /// no such control.
     pub spk_mute_ctl: &'static str,
@@ -322,6 +325,7 @@ static MIDI: Model = Model {
     alsa_lib: "",
     software_volume: false,
     amp_master: "",
+    wake_only_commands: false,
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: STOCK_VOLUME,
@@ -385,6 +389,7 @@ static LITE2: Model = Model {
     alsa_lib: "",
     software_volume: false,
     amp_master: "",
+    wake_only_commands: false,
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: STOCK_VOLUME,
@@ -456,6 +461,7 @@ static MINI2: Model = Model {
     alsa_lib: "",
     software_volume: false,
     amp_master: "",
+    wake_only_commands: false,
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: MINI2_VOLUME,
@@ -522,6 +528,7 @@ static MINI: Model = Model {
     // Controller applies the volume to the GStreamer player channels instead.
     software_volume: true,
     amp_master: "",
+    wake_only_commands: false,
     spk_mute_ctl: "SPK mute",
     // The stock maind opens the tdm_state amplifier gates; without them the ALSA sink runs but the
     // speaker stays silent (SPK mute cannot be cleared while amp_table is 0). The driver clears
@@ -581,6 +588,7 @@ static STATION2: Model = Model {
     // Одна шкала с AirPlay: Shairport и демон пишут в усилитель напрямую, минуя hardvold.
     software_volume: false,
     amp_master: "SY6045S Master Playback Volume",
+    wake_only_commands: true,
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: STATION2_VOLUME,
@@ -652,6 +660,7 @@ static MINI3: Model = Model {
     alsa_lib: "",
     software_volume: false,
     amp_master: "",
+    wake_only_commands: false,
     spk_mute_ctl: "",
     amp_enable_paths: &[],
     volume_map: MINI3_VOLUME,
@@ -857,6 +866,7 @@ mod tests {
         assert_eq!(m.spk_channels, &[8, 9]);
         assert!(!m.software_volume);
         assert_eq!(m.amp_master, "SY6045S Master Playback Volume");
+        assert!(m.wake_only_commands);
         assert!(!m.has_button_events());
     }
 

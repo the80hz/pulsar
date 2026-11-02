@@ -38,6 +38,12 @@ const PREROLL_SAMPLES: usize = 16384;
 /// End of speech for the "wake timing" log: the newest block within 20 dB (power) of the
 /// loudest one in the level window.
 const SPEECH_END_RATIO: f32 = 0.01;
+/// Хвост командного слова: столько звука после него смотрим, договорил ли человек. Начало хвоста —
+/// ещё само слово и его реверберация.
+const COMMAND_TAIL_SKIP_SAMPLES: usize = 3200;
+const COMMAND_TAIL_SAMPLES: usize = 8000;
+/// Речь продолжается, если блок громче этой доли (по мощности, -15 дБ) самого громкого в окне.
+const COMMAND_TAIL_RATIO: f32 = 0.03;
 
 /// ALSA buffer in VQE chunks: 256 ms with 32 ms chunks, 128 ms on the Mini 3 and Mini (16 ms);
 /// the device may grant less (Lite 2: 2048 frames).
@@ -63,6 +69,9 @@ pub enum FrontendEvent {
     },
     Command {
         word: String,
+        /// После слова речь продолжилась: это часть длинной фразы. Смотрят только модели с
+        /// `Model::wake_only_commands`, на остальных всегда false.
+        followed: bool,
     },
     /// 16 kHz mono, one VQE chunk (512 samples, 256 on the Mini 3 and Mini), while streaming is on
     /// or a `Wake` is not yet handled.
@@ -664,6 +673,34 @@ impl LevelHistory {
     }
 }
 
+/// Ждёт конца хвоста командного слова на чанках VQE_OMNI.
+struct CommandTail {
+    word: String,
+    floor: f32,
+    samples: usize,
+    followed: bool,
+}
+
+impl CommandTail {
+    fn new(word: String, peak: f32) -> Self {
+        Self {
+            word,
+            floor: COMMAND_TAIL_RATIO * peak,
+            samples: 0,
+            followed: false,
+        }
+    }
+
+    /// True, когда хвост кончился.
+    fn push(&mut self, level: f32, len: usize) -> bool {
+        self.samples += len;
+        if self.samples > COMMAND_TAIL_SKIP_SAMPLES && level >= self.floor {
+            self.followed = true;
+        }
+        self.samples >= COMMAND_TAIL_SAMPLES
+    }
+}
+
 /// The last VQE chunks as s16, for the pre-roll after a wake word.
 pub(crate) struct PrerollRing {
     buf: Vec<i16>,
@@ -781,6 +818,7 @@ fn processing(
     let mut ring = PrerollRing::new(PREROLL_SAMPLES / frame.max(1), frame);
     // Chunks since the wake spotter's 1st-stage hit, while its verifier waits.
     let mut first_stage_age: Option<usize> = None;
+    let mut command_tail: Option<CommandTail> = None;
 
     while shared.running() {
         let pending = lock(&shared.pending_model).take();
@@ -826,6 +864,18 @@ fn processing(
             && !d.is_empty()
         {
             level_hist.push(d);
+            let level = mean_square(d);
+            if command_tail
+                .as_mut()
+                .is_some_and(|t| t.push(level, d.len()))
+                && let Some(t) = command_tail.take()
+            {
+                info!("command '{}': followed by speech: {}", t.word, t.followed);
+                let _ = tx.send(FrontendEvent::Command {
+                    word: t.word,
+                    followed: t.followed,
+                });
+            }
         }
 
         // Every chunk goes into the ring, so a pre-roll never spans a gap. A `Wake` not yet
@@ -886,7 +936,22 @@ fn processing(
         }
         if shared.commands.load(Relaxed) {
             for word in eng.feed_command() {
-                let _ = tx.send(FrontendEvent::Command { word });
+                if !model.wake_only_commands {
+                    let _ = tx.send(FrontendEvent::Command {
+                        word,
+                        followed: false,
+                    });
+                    continue;
+                }
+                // Новое слово внутри хвоста предыдущего: предыдущее было началом фразы.
+                if let Some(t) = command_tail.take() {
+                    let _ = tx.send(FrontendEvent::Command {
+                        word: t.word,
+                        followed: true,
+                    });
+                }
+                let peak = level_hist.values.iter().copied().fold(0.0f32, f32::max);
+                command_tail = Some(CommandTail::new(word, peak));
             }
         }
     }
@@ -897,6 +962,29 @@ mod tests {
     use super::*;
     use pulsar_alsa::HwResult;
     use pulsar_core::model::model_from_compatible;
+
+    #[test]
+    fn command_tail_hears_a_longer_phrase() {
+        let mut t = CommandTail::new("тише".into(), 1.0);
+        // Хвост самого слова не считается.
+        for _ in 0..6 {
+            assert!(!t.push(1.0, 512));
+        }
+        assert!(!t.followed);
+        assert!(!t.push(0.5, 512));
+        assert!(t.followed);
+    }
+
+    #[test]
+    fn command_tail_ends_in_silence() {
+        let mut t = CommandTail::new("тише".into(), 1.0);
+        let mut chunks = 0;
+        while !t.push(0.001, 512) {
+            chunks += 1;
+        }
+        assert_eq!(chunks, 15);
+        assert!(!t.followed);
+    }
 
     #[test]
     fn s32_capture_keeps_the_top_16_of_24_bits() {

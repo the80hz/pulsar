@@ -13,6 +13,19 @@ use pulsar_media::PlayState;
 /// After the wake word a stock command ("Алиса, громче") is handled locally if it is heard
 /// within this window; the HA pipeline is then cancelled.
 pub const COMMAND_AFTER_WAKE_MS: i64 = 2500;
+/// Запас для `Model::wake_only_commands`: слово приходит только после хвоста в frontend.
+pub const COMMAND_TAIL_MS: i64 = 500;
+/// Шаг телефона неравномерен: внизу шкалы около 16 единиц регулятора (источник -24.33 = 185,
+/// -27.98 = 154, а его шаг 1.875). Это только первая оценка, дальше считается по замеру.
+const AIRPLAY_STEP_RAW_LOW: i64 = 16;
+const AIRPLAY_STEP_RAW_HIGH: i64 = 6;
+const AIRPLAY_STEP_RAW_BOUNDARY: i64 = 200;
+/// Ниже этого телефон уже почти на нуле: следующий шаг выключил бы звук совсем.
+const AIRPLAY_FLOOR_RAW: i64 = 150;
+/// На сколько единиц регулятора меняют громкость слова «громче» и «тише», около 6 дБ.
+pub const AIRPLAY_WORD_RAW: i64 = 12;
+/// Вся шкала телефона.
+pub const AIRPLAY_MAX_STEPS: u32 = 16;
 
 /// Music paused on this station, or whose Sendspin stream ended (pause or stop in Music
 /// Assistant), stays its own this long: without the wake word the transport and volume words
@@ -292,9 +305,44 @@ pub fn command_allowed(
     }
 }
 
+pub fn airplay_step_estimate(raw: i64) -> i64 {
+    if raw < AIRPLAY_STEP_RAW_BOUNDARY {
+        AIRPLAY_STEP_RAW_LOW
+    } else {
+        AIRPLAY_STEP_RAW_HIGH
+    }
+}
+
+/// Нужен ли ещё шаг телефона к уровню `target`, и в какую сторону (true: вверх). Источник принимает
+/// только шаги, поэтому останавливаемся на ближайшем уровне и не уводим его в ноль.
+pub fn airplay_next_step(raw: i64, target: i64, step_raw: i64) -> Option<bool> {
+    let diff = target - raw;
+    if diff.abs() * 2 <= step_raw {
+        return None;
+    }
+    let up = diff > 0;
+    if !up && raw - step_raw < AIRPLAY_FLOOR_RAW {
+        return None;
+    }
+    Some(up)
+}
+
+/// Что играет приёмник AirPlay с точки зрения HA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AirplayState {
+    None,
+    Playing,
+    Paused,
+}
+
 /// HA media player state. ANNOUNCING only for HA announcements, not for earcons, timer alarms or
-/// pipeline TTS on the same channel.
-pub fn media_state(announcing: bool, music: PlayState, sendspin_streaming: bool) -> MediaState {
+/// pipeline TTS on the same channel. AirPlay виден, когда больше ничего не играет.
+pub fn media_state(
+    announcing: bool,
+    music: PlayState,
+    sendspin_streaming: bool,
+    airplay: AirplayState,
+) -> MediaState {
     if announcing {
         return MediaState::Announcing;
     }
@@ -303,7 +351,11 @@ pub fn media_state(announcing: bool, music: PlayState, sendspin_streaming: bool)
         PlayState::Paused if sendspin_streaming => MediaState::Playing,
         PlayState::Paused => MediaState::Paused,
         _ if sendspin_streaming => MediaState::Playing,
-        _ => MediaState::Idle,
+        _ => match airplay {
+            AirplayState::None => MediaState::Idle,
+            AirplayState::Playing => MediaState::Playing,
+            AirplayState::Paused => MediaState::Paused,
+        },
     }
 }
 

@@ -20,8 +20,6 @@ const OUTPUT_HW_PARAMS: &str = "/proc/asound/card0/pcm0p/sub0/hw_params";
 const RELEASE_TIMEOUT: Duration = Duration::from_millis(3500);
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 const WATCH_PERIOD: Duration = Duration::from_secs(1);
-/// Шаг iPhone 1/16 шкалы, около 3 дБ в середине. Два дают примерно шаг голосовой команды.
-const VOLUME_STEPS: usize = 2;
 const RESET_RATE: u32 = 48_000;
 const RESET_CHANNELS: u32 = 2;
 const RESET_FRAME_BYTES: usize = 4;
@@ -34,7 +32,7 @@ const MUTE_LINES: &str = "#pulsar-mute\nmute=1\n";
 
 pub enum AirplayEvent {
     /// Запрос громкости ушёл источнику. `sent`: приёмник его принял.
-    VolumeSent { up: bool, sent: bool },
+    VolumeSent { sent: bool },
     /// Пауза отработала. `closed`: выход свободен и такт захвата снова 48 кГц.
     Released { closed: bool },
 }
@@ -42,7 +40,12 @@ pub enum AirplayEvent {
 enum Cmd {
     Pause,
     Resume,
-    Volume { up: bool },
+    /// Диалог кончился, а музыка остаётся на паузе: вернуть только заглушение.
+    KeepPaused,
+    Action(&'static str),
+    Volume {
+        up: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -70,6 +73,28 @@ impl AirplayHandle {
         let _ = self.cmds.send(Cmd::Resume);
     }
 
+    pub fn keep_paused(&self) {
+        let _ = self.cmds.send(Cmd::KeepPaused);
+    }
+
+    pub fn pause(&self) {
+        let _ = self.cmds.send(Cmd::Action("pause"));
+    }
+
+    pub fn play(&self) {
+        let _ = self.cmds.send(Cmd::Action("play"));
+    }
+
+    /// Трек меняет источник, на всю группу AirPlay. Нет приёмника: false.
+    pub fn skip(&self, next: bool) -> bool {
+        if !self.available {
+            return false;
+        }
+        let action = if next { "next" } else { "previous" };
+        let _ = self.cmds.send(Cmd::Action(action));
+        true
+    }
+
     /// Шаг громкости через источник: ползунок на телефоне двигается, а его уровень не отменит
     /// команду при следующем запуске потока. Идёт в очереди после паузы и её снятия.
     pub fn step_volume(&self, up: bool) {
@@ -77,10 +102,15 @@ impl AirplayHandle {
     }
 }
 
+/// Есть ли на станции приёмник AirPlay.
+pub fn receiver_installed() -> bool {
+    Path::new(ACTION_SCRIPT).exists()
+}
+
 pub fn spawn(model: &'static Model) -> (AirplayHandle, UnboundedReceiver<AirplayEvent>) {
     let (cmds, cmds_rx) = mpsc::unbounded_channel();
     let (events, events_rx) = mpsc::unbounded_channel();
-    let available = Path::new(ACTION_SCRIPT).exists();
+    let available = receiver_installed();
     if available {
         info!("airplay: receiver found, pausing it for voice dialogs");
         actors::spawn_actor("airplay", run(model, cmds_rx, events));
@@ -121,9 +151,17 @@ async fn run(
                         restore_dsp();
                     }
                 }
+                Some(Cmd::KeepPaused) => {
+                    if std::mem::take(&mut muted) {
+                        restore_dsp();
+                    }
+                }
+                Some(Cmd::Action(action)) => {
+                    run_action(action).await;
+                }
                 Some(Cmd::Volume { up }) => {
-                    let sent = send_volume(up).await;
-                    let _ = events.send(AirplayEvent::VolumeSent { up, sent });
+                    let sent = run_action(if up { "volume-up" } else { "volume-down" }).await;
+                    let _ = events.send(AirplayEvent::VolumeSent { sent });
                 }
                 None => return,
             },
@@ -228,16 +266,6 @@ async fn wait_closed() -> bool {
 
 async fn toggle() {
     run_action("toggle").await;
-}
-
-async fn send_volume(up: bool) -> bool {
-    let action = if up { "volume-up" } else { "volume-down" };
-    for _ in 0..VOLUME_STEPS {
-        if !run_action(action).await {
-            return false;
-        }
-    }
-    true
 }
 
 async fn run_action(action: &'static str) -> bool {

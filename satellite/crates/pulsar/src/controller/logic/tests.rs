@@ -296,11 +296,49 @@ fn media_player_state() {
         (false, P::Error, true, M::Playing),
     ] {
         assert_eq!(
-            media_state(announcing, music, ss),
+            media_state(announcing, music, ss, AirplayState::None),
             want,
             "{announcing} {music:?} {ss}"
         );
     }
+}
+
+#[test]
+fn media_player_state_with_airplay() {
+    use AirplayState as A;
+    use MediaState as M;
+    use PlayState as P;
+    assert_eq!(media_state(false, P::Idle, false, A::Playing), M::Playing);
+    assert_eq!(media_state(false, P::Idle, false, A::Paused), M::Paused);
+    assert_eq!(media_state(false, P::Idle, false, A::None), M::Idle);
+    // Своё важнее: объявление и пауза на канале HA.
+    assert_eq!(media_state(true, P::Idle, false, A::Playing), M::Announcing);
+    assert_eq!(media_state(false, P::Paused, false, A::Playing), M::Paused);
+}
+
+#[test]
+fn airplay_steps_stop_at_the_nearest_level() {
+    assert_eq!(airplay_next_step(196, 163, 16), Some(false));
+    assert_eq!(airplay_next_step(180, 163, 16), Some(false));
+    // Ещё шаг увёл бы дальше от цели, чем сейчас.
+    assert_eq!(airplay_next_step(170, 163, 16), None);
+    assert_eq!(airplay_next_step(158, 163, 16), None);
+    assert_eq!(airplay_next_step(146, 178, 16), Some(true));
+}
+
+#[test]
+fn airplay_steps_do_not_mute_the_source() {
+    // Источник -27.98: следующий шаг телефона это ноль и выключенный звук.
+    assert_eq!(airplay_next_step(154, 100, 16), None);
+    assert_eq!(airplay_next_step(170, 100, 16), Some(false));
+    // Вверх такой защиты не нужно.
+    assert_eq!(airplay_next_step(146, 200, 16), Some(true));
+}
+
+#[test]
+fn airplay_step_is_larger_at_the_bottom_of_the_scale() {
+    assert_eq!(airplay_step_estimate(185), 16);
+    assert_eq!(airplay_step_estimate(230), 6);
 }
 
 #[test]
