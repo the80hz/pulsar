@@ -101,25 +101,29 @@ mod tests {
         assert!(close(d.factor(), 0.0526));
     }
 
-    /// Readings where the fused and the unfused arithmetic round differently; expected bits
-    /// from the C++ `AmbientDimmer` built with FMA contraction (unfused it gives 3cbae0ea,
-    /// 3ccdc4b0, 3d6e24a3, 3d4d3b5a).
+    /// Эталон C fmaf: начало при 500 лк (target=1), затем темнота (target=0.02).
+    /// Промежуточные lux зависели от точности системного log10f, а проверять нужно FMA.
+    /// На шагах 3, 8 и 10 арифметика без слияния отличается на один бит.
     #[test]
     fn rounds_like_the_fused_cxx_build() {
-        let first = |lux: u32| {
-            let mut d = AmbientDimmer::new();
-            d.update(f32::from_bits(lux));
-            d.factor().to_bits()
-        };
-        assert_eq!(first(0x3c93_74bd), 0x3cba_e0eb); // 0.018 lx
-        assert_eq!(first(0x3d07_2b02), 0x3ccd_c4af); // 0.033 lx
-        let second = |lux: u32| {
-            let mut d = AmbientDimmer::new();
+        let mut d = AmbientDimmer::new();
+        d.update(500.0);
+        for bits in [
+            0x3f34_bc6a,
+            0x3f00_0d1b,
+            0x3eb6_57fb,
+            0x3e82_b66b,
+            0x3e3d_2440,
+            0x3e0a_8b0a,
+            0x3dce_3f95,
+            0x3d9c_a96f,
+            0x3d73_e710,
+            0x3d43_4ecd,
+            0x3d21_4a9e,
+            0x3d09_7ae3,
+        ] {
             d.update(0.0);
-            d.update(f32::from_bits(lux));
-            d.factor().to_bits()
-        };
-        assert_eq!(second(0x3f9e_b852), 0x3d6e_24a5); // 1.24 lx
-        assert_eq!(second(0x3f63_d70a), 0x3d4d_3b59); // 0.89 lx
+            assert_eq!(d.smooth.to_bits(), bits);
+        }
     }
 }

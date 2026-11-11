@@ -3,7 +3,7 @@
 # PULSAR_TAG: free-form tag of the work holding the lock (one word, no spaces).
 set -eu
 usage() {
-  echo "usage: PULSAR_TAG=<tag> $0 midi|lite2|mini lock MINUTES|unlock|break-lock|stop|start|push FILE...|test-start|test-stop|test-log [N]|swap BINARY|restore|cleanup|status|log [N]" >&2
+  echo "usage: PULSAR_TAG=<tag> $0 midi|lite2|mini|station2 lock MINUTES|unlock|break-lock|stop|start|push FILE...|test-start|test-stop|test-log [N]|swap BINARY|restore|cleanup|status|log [N]" >&2
   exit 2
 }
 [ $# -ge 2 ] || usage
@@ -11,6 +11,7 @@ case "$1" in
   midi) H=${PULSAR_MIDI:?PULSAR_MIDI is not set} ;;
   lite2) H=${PULSAR_LITE2:?PULSAR_LITE2 is not set} ;;
   mini) H=${PULSAR_MINI:?PULSAR_MINI is not set} ;;
+  station2) H=${PULSAR_STATION2:?PULSAR_STATION2 is not set} ;;
   *) usage ;;
 esac
 station=$1
@@ -19,7 +20,9 @@ shift 2
 L=/tmp/pulsar-agent.lock
 T=/tmp/pulsar-test
 D=/data/pulsar
-r() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 "$H" "$@"; }
+PORT=${PULSAR_SSH_PORT:-22}
+[ "$station" != station2 ] || PORT=${PULSAR_SSH_PORT:-2222}
+r() { ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 "$H" "$@"; }
 # up SRC DEST: upload to DEST.part, verify size and sha256 against SRC, then rename to DEST (mode 755).
 up() {
   src=$1 dest=$2
@@ -63,6 +66,66 @@ done
 if [ -n "$r" ]; then echo "removed stale ALSA dmix lock (${r# })"; fi
 EOF
 )
+if [ "$station" = station2 ]; then
+  case "$cmd" in
+    status)
+      r "id; cat /system/vendor/quasar/version_full; pidof pulsar shairport-sync owner-display station-touch; ls -l $D/pulsar; df -Pk $D; cat $L/owner 2>/dev/null || echo 'no lock'"
+      exit ;;
+    stop)
+      own
+      r sh -s <<'REMOTE'
+set -eu
+D=/data/pulsar
+L=/tmp/pulsar-agent.lock
+[ -x /data/local/opt/ap2/pulsar-supervisor.sh ]
+[ ! -e /tmp/hot_poweroff ]
+[ ! -e "$D/disabled" ] || [ -f "$L/disabled-by-test" ] || { echo 'Voice disabled by owner' >&2; exit 1; }
+touch "$D/disabled" "$L/disabled-by-test"
+if [ -s /run/pulsar-supervisor.pid ]; then
+ p=$(cat /run/pulsar-supervisor.pid)
+ case "$p" in ''|*[!0-9]*) exit 1 ;; esac
+ if [ -r "/proc/$p/cmdline" ] && tr '\0' ' ' < "/proc/$p/cmdline" | grep -q '/ap2/pulsar-supervisor.sh'; then kill "$p"; fi
+fi
+n=0
+while pidof pulsar >/dev/null && [ "$n" -lt 15 ]; do sleep 1; n=$((n+1)); done
+! pidof pulsar >/dev/null || { echo 'Daemon did not stop; refusing hardware test' >&2; exit 1; }
+echo stopped
+REMOTE
+      exit ;;
+    start)
+      own
+      r "[ -f $L/disabled-by-test ] && rm -f $D/disabled $L/disabled-by-test; /data/local/opt/ap2/ap2.sh pulsar"
+      exit ;;
+    test-start)
+      own
+      r sh -s <<'REMOTE'
+set -eu
+T=/tmp/pulsar-test
+D=/data/pulsar
+! pidof pulsar >/dev/null || { echo 'run stop first' >&2; exit 1; }
+[ -f /tmp/pulsar-agent.lock/disabled-by-test ]
+[ -x "$T/pulsar" ]
+grep -v -e '^api_key=' -e '^muted=' -e '^auto_update=' -e '^update_attempt=' "$D/state.conf" > "$T/state.conf"
+printf 'muted=1\nauto_update=0\n' >> "$T/state.conf"
+cd "$T"
+nohup env PULSAR_PORT_OFFSET=10000 ./pulsar "$T/state.conf" < /dev/null >> "$T/log" 2>&1 &
+echo $! > "$T/pid"
+sleep 2
+kill -0 "$(cat "$T/pid")" && echo started
+REMOTE
+      exit ;;
+    test-stop)
+      own
+      r "p=\$(cat $T/pid) || exit 1; kill \$p; n=0; while kill -0 \$p 2>/dev/null && [ \$n -lt 15 ]; do sleep 1; n=\$((n+1)); done; ! kill -0 \$p 2>/dev/null || exit 1; rm -f $T/pid"
+      exit ;;
+    cleanup)
+      own
+      r "if [ -s $T/pid ] && kill -0 \$(cat $T/pid) 2>/dev/null; then exit 1; fi; rm -rf $T"
+      exit ;;
+    lock|unlock|push|log|test-log) ;;
+    *) echo 'Station 2 uses a separately backed-up owner-media deployment, not upstream swap/restore' >&2; exit 2 ;;
+  esac
+fi
 case "$cmd" in
   lock)
     [ $# -eq 1 ] || usage

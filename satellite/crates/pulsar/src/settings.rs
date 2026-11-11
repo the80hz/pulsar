@@ -62,8 +62,13 @@ pub struct Settings {
     pub led_speed: f32,
     /// Listening / thinking / speaking shown on the ring and the clock.
     pub voice_indication: bool,
-    /// Audio between the end of the wake word and its confirmation goes ahead of the request.
-    pub wake_preroll: bool,
+    /// Сколько ждать начала речи в follow-up-реплике, с; 0 — не продолжать разговор.
+    pub followup_duration_s: u32,
+    /// Сдвиг начала звука запроса от точки хита спотера wake word, мс («Command start offset»).
+    pub command_start_offset_ms: i32,
+    /// Усиление звука запроса перед отправкой в HA, дБ («Microphone gain»); 0 — канал VQE как
+    /// есть.
+    pub mic_gain_db: u32,
     /// Stem of `pulsar_hw::case_colors()`, "" = none.
     pub led_case_color: String,
     /// Release being installed. Still set after a restart into another version: that release
@@ -97,7 +102,14 @@ impl Default for Settings {
             clock_music: "Off".into(),
             led_speed: 1.0,
             voice_indication: true,
-            wake_preroll: true,
+            followup_duration_s: 10,
+            // Подбор 2026-11-04 (Миди, 35 фраз «Алиса»/«Яндекс», STT faster-whisper): хвост
+            // «Алисы» («Так,» перед командой) — до +20 мс, с +30 мс отрезается начало команды
+            // («Открой шторы» → «Закрой шторы»), запаса между ними нет. При 0 одна фраза из 35
+            // получила лишнее «Так,» перед целой командой; перевёрнутых команд нет.
+            command_start_offset_ms: 0,
+            // см. docs/voice.md, «Голосовой ассистент HA (ESPHome)»
+            mic_gain_db: 0,
             led_case_color: String::new(),
             update_attempt: String::new(),
             zigbee_role: Mode::Off,
@@ -170,7 +182,21 @@ impl Settings {
                     };
                 }
                 b"voice_indication" => self.voice_indication = on,
-                b"wake_preroll" => self.wake_preroll = on,
+                b"followup_duration_s" => {
+                    if let Some(s) = pulsar_esphome::followup_duration_s(fv) {
+                        self.followup_duration_s = s;
+                    }
+                }
+                b"command_start_offset_ms" => {
+                    if let Some(ms) = pulsar_esphome::command_offset_ms(fv) {
+                        self.command_start_offset_ms = ms;
+                    }
+                }
+                b"mic_gain_db" => {
+                    if let Some(db) = pulsar_esphome::mic_gain_db(fv) {
+                        self.mic_gain_db = db;
+                    }
+                }
                 b"led_case_color" => self.led_case_color = v,
                 _ => {}
             }
@@ -183,8 +209,8 @@ impl Settings {
         }
     }
 
-    /// The file as C++ `Settings::save` writes it: every key, in its order.
-    /// `wake_preroll` and `clock_auto_brightness` were added after the C++ reference fixtures.
+    /// Файл в том виде, как его пишет C++ `Settings::save`: все ключи, в его порядке; ключи,
+    /// добавленные после фикстур эталона, перечислены в шапке `settings/tests.rs`.
     pub fn serialize(&self) -> String {
         let f = |v: f32| g6(f64::from(v));
         let b = |v: bool| u8::from(v);
@@ -194,7 +220,8 @@ impl Settings {
              light_b={}\nlight_effect={}\nwake_word={}\ntz={}\nauto_update={}\nupdate_attempt={}\n\
              zigbee_role={}\nzigbee_flash_failed={:x}\nnearest_answers={}\nmusic_viz={}\n\
              led_speed={}\nvoice_indication={}\nled_case_color={}\nclock_music={}\n\
-             wake_preroll={}\nclock_auto_brightness={}\n",
+             clock_auto_brightness={}\nfollowup_duration_s={}\n\
+             command_start_offset_ms={}\nmic_gain_db={}\n",
             f(self.volume),
             f(self.volume_legacy),
             b(self.muted),
@@ -220,8 +247,10 @@ impl Settings {
             b(self.voice_indication),
             self.led_case_color,
             self.clock_music,
-            b(self.wake_preroll),
             b(self.clock_auto_brightness),
+            self.followup_duration_s,
+            self.command_start_offset_ms,
+            self.mic_gain_db,
         )
     }
 

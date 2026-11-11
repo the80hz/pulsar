@@ -1,7 +1,7 @@
 ---
 name: station-test
 description: >-
-  Тестирование pulsar на живых станциях Яндекса (Миди, Лайт 2, Мини) через tools/station.sh: lock, остановка демона, тестовый экземпляр, probe-утилиты, живая подмена, очистка. Ключевые слова: station test, live station, lock, stop, test-start, swap, restore, cleanup, esphome_check, dmix, hardware probe.
+  Тестирование pulsar на живых станциях Яндекса (Миди, Лайт 2, Мини, Станция 2) через tools/station.sh: lock, остановка демона, тестовый экземпляр, probe-утилиты, живая подмена, очистка. Ключевые слова: station test, live station, lock, stop, test-start, swap, restore, cleanup, esphome_check, dmix, hardware probe.
 ---
 
 # Тест на живой станции
@@ -13,13 +13,13 @@ description: >-
 ## 1. Допуск
 
 - Адрес станции и метка работы берутся из окружения: `PULSAR_MIDI`, `PULSAR_LITE2` или
-  `PULSAR_MINI` и `PULSAR_TAG`; адреса в репозиторий не писать. Нет переменной — статус
+  `PULSAR_MINI`, `PULSAR_STATION2` и `PULSAR_TAG`; адреса в репозиторий не писать. Нет переменной — статус
   `заблокирован: нет PULSAR_<X>` (`docs/stations.md`, пункт «Адреса»), дальше не идти.
-- `tools/station.sh` знает только `midi|lite2|mini`. Для Мини 2 и Мини 3 (модель уже поддержана) цели
+- `tools/station.sh` знает только `midi|lite2|mini|station2`. Для Мини 2 и Мини 3 (модель уже поддержана) цели
   в нём нет: сначала добавить её (сам скрипт, перечни целей в этом skill и пункт «Громкость» в
   `docs/stations.md`; ключ dmix модели — `add-station-model`, п. 2, «Ключ dmix»). Для модели,
   неизвестной установщику, — skill `add-station-model`.
-- Вызов: `PULSAR_TAG=<метка> tools/station.sh <midi|lite2|mini> <команда>`. Начать с `status`
+- Вызов: `PULSAR_TAG=<метка> tools/station.sh <midi|lite2|mini|station2> <команда>`. Начать с `status`
   (ничего не меняет): кто держит lock, режим станции.
 
 ## 2. Lock
@@ -77,3 +77,6 @@ description: >-
 
 Порядок и условия — `docs/stations.md`, пункт «Lock». Сообщить пользователю итог и что станция
 возвращена владельцу.
+
+Станция 2: target `station2`, PULSAR_STATION2 задаётся вызывающим, SSH 2222.
+В форке owner-media lifecycle отличается от upstream ctl.sh; не применять ctl.sh вслепую.

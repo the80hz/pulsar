@@ -120,6 +120,8 @@ enum Tk {
     UiAfterError,
     /// Ends a LISTENING / PROCESSING phase HA never advances.
     Watchdog,
+    /// В follow-up-реплике речь не началась за окно.
+    FollowupWait,
     /// The shown running HA timer runs out.
     TimerTick,
     /// Next round of the timer ring.
@@ -224,6 +226,10 @@ pub struct Controller {
     phase: Phase,
     /// Start of the current LISTENING phase (commands window).
     listen_started_ms: i64,
+    /// Текущий диалог открыт wake word (не кнопкой, не продолжением диалога и не HA).
+    wake_dialog: bool,
+    /// Звонок выключили посреди этого диалога «стоп» спотера или wake word, а диалог пошёл дальше.
+    ring_stopped_in_dialog: bool,
     hw_mic_muted: bool,
     error_shown: bool,
     // Wake arbitration: the window between our claim and the decision. Microphone audio and a
@@ -249,7 +255,7 @@ pub struct Controller {
     /// A run's TTS_START left HA's assist satellite "responding" until AnnounceFinished, also
     /// when nothing plays here, and that report is still to be sent (`send_tts_report`).
     tts_report_owed: bool,
-    continue_conversation: bool,
+    followup: logic::Followup,
     /// An HA announcement (assist or media player) plays on ANNOUNCE.
     announcing: bool,
     ducked: bool,
@@ -407,7 +413,6 @@ impl Controller {
             },
             has_clock: model.has_clock || pulsar_clock::panel_present(model),
             has_lux: model.has_lux || lux_rx.is_some(),
-            has_wake_preroll: !model.wake_preroll.is_empty(),
             has_hw_mic_mute: !model.mute_input.is_empty() || model.mute_gpio != 0,
             has_buttons: model.has_button_events(),
             has_track_buttons: airplay::receiver_installed(),
@@ -513,7 +518,8 @@ impl Controller {
             model_dir(&st.wake_word),
             Some(PathBuf::from(COMMAND_MODEL)),
         );
-        mic.set_preroll(st.wake_preroll);
+        mic.set_command_offset(st.command_start_offset_ms);
+        mic.set_mic_gain(st.mic_gain_db);
 
         let ss_cfg = SendspinConfig {
             name: id.friendly_name.clone(),
@@ -653,6 +659,8 @@ impl Controller {
             applied_tz,
             phase: Phase::Idle,
             listen_started_ms: 0,
+            wake_dialog: false,
+            ring_stopped_in_dialog: false,
             hw_mic_muted,
             error_shown: false,
             arbitrating: false,
@@ -668,7 +676,7 @@ impl Controller {
             tts_url: String::new(),
             tts_played: false,
             tts_report_owed: false,
-            continue_conversation: false,
+            followup: logic::Followup::default(),
             announcing: false,
             ducked: false,
             closing_earcon: false,
@@ -820,6 +828,10 @@ impl Controller {
         match k {
             Tk::UiAfterNotSubscribed | Tk::UiAfterError => self.update_ui(),
             Tk::Watchdog => self.abort_dialog("no progress from Home Assistant, giving up"),
+            Tk::FollowupWait => {
+                info!("follow-up: no speech started, conversation ends");
+                self.finish_interaction();
+            }
             Tk::TimerTick => self.show_timers(),
             Tk::RingTick => self.ring_timer(),
             Tk::AmpSync => self.sync_amp(),
@@ -946,7 +958,7 @@ impl Controller {
     fn show_ui(&self, s: UiState) {
         self.leds.set_ui_state(s);
         self.clock.set_ui_state(s);
-        self.owner_light.set_ui_state(s);
+        self.owner_light.set_ui_state(s, self.mic_muted());
     }
 
     fn update_detection(&self) {

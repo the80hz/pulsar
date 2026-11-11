@@ -63,3 +63,18 @@
 Удалённые команды `tools/station.sh` выполняются на станции в busybox ash. Python-клиенты
 `tools/esphome_check.py` и `tools/sendspin_server.py` ставят зависимости из `tools/requirements.txt`;
 `tools/deconz_read.py` обходится стандартной библиотекой.
+
+## Станция 2 с owner-media
+
+Цель station2, переменная PULSAR_STATION2, SSH 2222. Общий dmix — 2048.
+Громкость общая на SY6045S Master Playback Volume; перед звуковым тестом
+сверять шкалу station2-equalizer, не переносить raw Миди. В этом опыте
+аппаратные тесты выполняются без звука, звук оценивает владелец после подключения HA.
+
+В owner-media target `stop` временно создаёт disabled, останавливает только
+pulsar-supervisor и его дочерний Pulsar; `start` убирает свой маркер и запускает
+`ap2.sh pulsar`. Рабочий AirPlay остаётся запущен. Тестовый config сохраняет
+громкость, включает mute и отключает обновления, API работает на 16053 без ключа.
+Образы радио не копируются. Старый общий `swap/restore` этому target не доступен:
+постоянную установку владелец разрешает отдельно, с собственным backup/rollback.
+Скрипт не очищает общий dmix 2048, пока им пользуется owner-media.
